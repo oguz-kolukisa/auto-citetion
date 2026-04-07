@@ -20,7 +20,10 @@ from search import (
     Paper, PaperPool, score_and_categorize,
     ss_keyword, ss_citations, ss_authors,
     si_semantic, si_similar, si_detail, si_collect_ids,
-    arxiv_search,
+    arxiv_search, run_parallel_apis,
+    _job_ss_keyword, _job_ss_citations, _job_ss_author,
+    _job_si_semantic, _job_si_similar, _job_si_detail,
+    _job_arxiv,
 )
 from evaluate import LLMEvaluator
 
@@ -241,26 +244,50 @@ def main():
     if not args.skip_search:
         print("=" * 50, "\nSTAGE 1: Search\n" + "=" * 50, file=sys.stderr)
         pool = PaperPool()
-        # Initial search fills the pool
+        # Build all initial jobs — run 3 APIs in parallel
         cookie_path = out / ".scholar_inbox_cookie"
+        if not cookie_path.exists():
+            # Also check repo root
+            root_cookie = Path(__file__).parent / ".scholar_inbox_cookie"
+            if root_cookie.exists():
+                cookie_path = root_cookie
         cookie = cookie_path.read_text().strip() if cookie_path.exists() else ""
 
+        ss_jobs = []
+        si_jobs = []
+        arxiv_jobs = []
+
+        # SS keyword jobs
+        for i, q in enumerate(cfg.get("semantic_scholar_queries", [])):
+            ss_jobs.append(lambda q=q, i=i: _job_ss_keyword(q, i))
+        # SS citation chain jobs
+        for aid in cfg.get("seed_arxiv_ids", []):
+            ss_jobs.append(lambda a=aid: _job_ss_citations(a))
+        # SS author jobs
+        for name in cfg.get("key_authors", []):
+            ss_jobs.append(lambda n=name: _job_ss_author(n))
+
+        # SI jobs
         if cookie and not args.skip_si:
-            si_semantic(pool, cfg.get("scholar_inbox_queries", []), cookie)
+            for i, q in enumerate(cfg.get("scholar_inbox_queries", [])):
+                si_jobs.append(lambda q=q, i=i: _job_si_semantic(q, i, cookie))
+            # Collect SI paper IDs for similar/detail expansion
             abstract = cfg.get("paper_abstract", "")
             if abstract:
-                ids = si_collect_ids(abstract, cookie)
-                if ids:
-                    si_similar(pool, ids[:25], cookie)
-                    si_detail(pool, ids[:15], cookie)
+                si_paper_ids = si_collect_ids(abstract, cookie)
+                for pid in si_paper_ids[:25]:
+                    si_jobs.append(lambda pid=pid: _job_si_similar(pid, cookie))
+                for pid in si_paper_ids[:15]:
+                    si_jobs.append(lambda pid=pid: _job_si_detail(pid, cookie))
         elif not args.skip_si:
             print("No .scholar_inbox_cookie found, skipping Scholar Inbox.", file=sys.stderr)
 
-        ss_keyword(pool, cfg.get("semantic_scholar_queries", []))
-        ss_citations(pool, cfg.get("seed_arxiv_ids", []))
-        ss_authors(pool, cfg.get("key_authors", []))
-        arxiv_search(pool, cfg.get("arxiv_queries", []))
+        # arXiv jobs
+        for i, q in enumerate(cfg.get("arxiv_queries", [])):
+            arxiv_jobs.append(lambda q=q, i=i: _job_arxiv(q, i))
 
+        print(f"\nJobs queued: SS={len(ss_jobs)} SI={len(si_jobs)} arXiv={len(arxiv_jobs)}", file=sys.stderr)
+        run_parallel_apis(pool, ss_jobs, si_jobs, arxiv_jobs)
         print(f"\nInitial pool: {pool.size}", file=sys.stderr)
 
         # Stage 1.5: Recursive expansion

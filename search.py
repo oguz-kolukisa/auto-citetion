@@ -102,7 +102,7 @@ class RateLimiter:
 
 
 # One limiter per API — they don't block each other
-_ss_limiter = RateLimiter(0.4)
+_ss_limiter = RateLimiter(1.0)   # SS shared rate limit is strict
 _si_limiter = RateLimiter(1.5)
 _arxiv_limiter = RateLimiter(3.0)
 
@@ -310,10 +310,9 @@ def _job_arxiv(query: str, idx: int) -> tuple[list[Paper], str]:
 
 # ── Job scheduler ─────────────────────────────────────────────────────────
 
-def run_jobs(pool: PaperPool, jobs: list, max_workers: int = 6) -> None:
-    """Run search jobs concurrently. Each job is a callable returning
-    (list[Paper], source_tag). Different APIs run in parallel,
-    each respecting its own rate limiter."""
+def run_jobs(pool: PaperPool, jobs: list, max_workers: int = 2) -> None:
+    """Run search jobs. Each job returns (list[Paper], source_tag).
+    Uses a small worker pool — rate limiters serialize per-API."""
     total = len(jobs)
     done = 0
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -328,6 +327,52 @@ def run_jobs(pool: PaperPool, jobs: list, max_workers: int = 6) -> None:
                           f"(pool: {pool.size})", file=sys.stderr)
             except Exception as e:
                 print(f"  [{done}/{total}] error: {e}", file=sys.stderr)
+
+
+def run_parallel_apis(pool: PaperPool,
+                      ss_jobs: list = None, si_jobs: list = None,
+                      arxiv_jobs: list = None) -> None:
+    """Run jobs across all 3 APIs truly in parallel.
+    Each API gets its own single-thread executor so rate limiters
+    serialize within an API, but different APIs overlap."""
+    ss_jobs = ss_jobs or []
+    si_jobs = si_jobs or []
+    arxiv_jobs = arxiv_jobs or []
+    total = len(ss_jobs) + len(si_jobs) + len(arxiv_jobs)
+    print(f"  Running {total} jobs across 3 APIs in parallel", file=sys.stderr)
+    done = [0]
+    lock = threading.Lock()
+
+    def _run_batch(jobs: list, label: str) -> None:
+        for job in jobs:
+            try:
+                papers, source = job()
+                added = pool.add_many(papers, source)
+                with lock:
+                    done[0] += 1
+                    if papers:
+                        print(f"  [{done[0]}/{total}] {source}: {len(papers)} found, "
+                              f"{added} new (pool: {pool.size})", file=sys.stderr)
+            except Exception as e:
+                with lock:
+                    done[0] += 1
+                    print(f"  [{done[0]}/{total}] {label} error: {e}", file=sys.stderr)
+
+    threads = []
+    if ss_jobs:
+        t = threading.Thread(target=_run_batch, args=(ss_jobs, "SS"), daemon=True)
+        threads.append(t)
+    if si_jobs:
+        t = threading.Thread(target=_run_batch, args=(si_jobs, "SI"), daemon=True)
+        threads.append(t)
+    if arxiv_jobs:
+        t = threading.Thread(target=_run_batch, args=(arxiv_jobs, "arXiv"), daemon=True)
+        threads.append(t)
+
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
 
 
 # ── High-level API (used by auto_citetion.py) ────────────────────────────
