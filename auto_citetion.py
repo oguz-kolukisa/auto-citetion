@@ -61,31 +61,56 @@ def is_known(title: str, known: set[str]) -> bool:
     return False
 
 
-# ── Search stage ──────────────────────────────────────────────────────────
+# ── Recursive expansion ───────────────────────────────────────────────────
 
-def run_search(cfg: dict, out: Path) -> list[Paper]:
-    pool = PaperPool()
+def run_recursive_expansion(pool: PaperPool, known: set[str],
+                            min_score: float, out: Path,
+                            max_depth: int = 3, expand_top: int = 15) -> None:
+    """Recursively expand: score papers, take top hits, crawl their
+    citations/similar, score again, repeat until no new finds."""
     cookie_path = out / ".scholar_inbox_cookie"
     cookie = cookie_path.read_text().strip() if cookie_path.exists() else ""
 
-    if cookie:
-        si_semantic(pool, cfg.get("scholar_inbox_queries", []), cookie)
-        abstract = cfg.get("paper_abstract", "")
-        if abstract:
-            ids = si_collect_ids(abstract, cookie)
-            if ids:
-                si_similar(pool, ids[:25], cookie)
-                si_detail(pool, ids[:15], cookie)
-    else:
-        print("No .scholar_inbox_cookie found, skipping Scholar Inbox.", file=sys.stderr)
+    for depth in range(1, max_depth + 1):
+        # Score everything in pool
+        all_papers = pool.all()
+        score_and_categorize(all_papers)
+        novel = [p for p in all_papers if not is_known(p.title, known) and p.score >= min_score]
+        novel.sort(key=lambda p: p.score, reverse=True)
 
-    ss_keyword(pool, cfg.get("semantic_scholar_queries", []))
-    ss_citations(pool, cfg.get("seed_arxiv_ids", []))
-    ss_authors(pool, cfg.get("key_authors", []))
-    arxiv_search(pool, cfg.get("arxiv_queries", []))
+        # Pick top papers that have arxiv_ids for expansion
+        seeds = [p for p in novel if p.arxiv_id][:expand_top]
+        if not seeds:
+            print(f"\n[Recursive depth {depth}] No new seeds, stopping.", file=sys.stderr)
+            break
 
-    print(f"\nTotal pool: {pool.size}", file=sys.stderr)
-    return pool.all()
+        before = pool.size
+        print(f"\n{'='*50}\n[Recursive depth {depth}] Expanding top {len(seeds)} papers\n{'='*50}", file=sys.stderr)
+
+        # Expand via Semantic Scholar citations + references
+        seed_ids = [p.arxiv_id for p in seeds]
+        ss_citations(pool, seed_ids)
+
+        # Expand via Scholar Inbox similar papers
+        if cookie:
+            si_ids = []
+            for p in seeds:
+                found = si_collect_ids(p.title, cookie, limit=3)
+                si_ids.extend(found)
+                if len(si_ids) >= 20:
+                    break
+                import time
+                time.sleep(1)
+            if si_ids:
+                si_similar(pool, si_ids[:20], cookie)
+
+        after = pool.size
+        new_found = after - before
+        print(f"[Recursive depth {depth}] +{new_found} new papers (total: {after})", file=sys.stderr)
+
+        if new_found < 5:
+            print(f"[Recursive depth {depth}] Few new finds, stopping.", file=sys.stderr)
+            break
 
 
 # ── Report generation ─────────────────────────────────────────────────────
@@ -202,6 +227,8 @@ def main():
     ap.add_argument("--top", type=int, default=80, help="Papers to evaluate with LLM")
     ap.add_argument("--min-score", type=float, default=4.0)
     ap.add_argument("--fast", action="store_true")
+    ap.add_argument("--depth", type=int, default=3, help="Recursive expansion depth (0=off)")
+    ap.add_argument("--expand-top", type=int, default=15, help="Papers to expand per round")
     args = ap.parse_args()
 
     out = Path(args.output)
@@ -213,12 +240,44 @@ def main():
     # Stage 1: Search
     if not args.skip_search:
         print("=" * 50, "\nSTAGE 1: Search\n" + "=" * 50, file=sys.stderr)
-        papers = run_search(cfg, out)
+        pool = PaperPool()
+        # Initial search fills the pool
+        cookie_path = out / ".scholar_inbox_cookie"
+        cookie = cookie_path.read_text().strip() if cookie_path.exists() else ""
+
+        if cookie and not args.skip_si:
+            si_semantic(pool, cfg.get("scholar_inbox_queries", []), cookie)
+            abstract = cfg.get("paper_abstract", "")
+            if abstract:
+                ids = si_collect_ids(abstract, cookie)
+                if ids:
+                    si_similar(pool, ids[:25], cookie)
+                    si_detail(pool, ids[:15], cookie)
+        elif not args.skip_si:
+            print("No .scholar_inbox_cookie found, skipping Scholar Inbox.", file=sys.stderr)
+
+        ss_keyword(pool, cfg.get("semantic_scholar_queries", []))
+        ss_citations(pool, cfg.get("seed_arxiv_ids", []))
+        ss_authors(pool, cfg.get("key_authors", []))
+        arxiv_search(pool, cfg.get("arxiv_queries", []))
+
+        print(f"\nInitial pool: {pool.size}", file=sys.stderr)
+
+        # Stage 1.5: Recursive expansion
+        depth = 1 if args.fast else args.depth
+        if depth > 0:
+            run_recursive_expansion(
+                pool, known, args.min_score, out,
+                max_depth=depth, expand_top=args.expand_top,
+            )
+
+        # Score, filter, save
+        papers = pool.all()
         score_and_categorize(papers)
         papers = [p for p in papers if not is_known(p.title, known) and p.score >= args.min_score]
         papers.sort(key=lambda p: p.score, reverse=True)
         raw_path.write_text(json.dumps([p.to_dict() for p in papers], indent=2))
-        print(f"Saved {len(papers)} papers", file=sys.stderr)
+        print(f"\nFinal: {len(papers)} papers after recursive expansion", file=sys.stderr)
     else:
         papers = [Paper.from_dict(d) for d in json.loads(raw_path.read_text())]
         papers = [p for p in papers if not is_known(p.title, known) and p.score >= args.min_score]

@@ -5,8 +5,10 @@ Find papers you should cite. Searches 3 academic APIs, then scores each paper wi
 ## How it works
 
 ```
-config.json → Search (7 strategies) → Score & Filter → LLM Evaluate → final_reading_list.md
+config.json → Search (7 strategies) → Recursive Expansion → Score & Filter → LLM Evaluate → final_reading_list.md
 ```
+
+After the initial search, the tool **recursively expands**: it takes the top-scoring papers, crawls their citations and similar papers, scores those, and repeats — up to 3 rounds deep. This snowball effect catches papers that keyword search alone would miss.
 
 **Search strategies:**
 - Scholar Inbox semantic search + similar papers + refs/cited_by
@@ -73,7 +75,9 @@ config              Config JSON file (required)
 --model ID          HuggingFace model (default: google/gemma-4-E4B-it)
 --top N             Papers to evaluate with LLM (default: 80)
 --min-score N       Minimum keyword score (default: 4.0)
---fast              Fewer queries + top 30 only
+--fast              Fewer queries + top 30 only + 1 recursive round
+--depth N           Recursive expansion depth (default: 3, 0=off)
+--expand-top N      Papers to expand per round (default: 15)
 ```
 
 ## Output
