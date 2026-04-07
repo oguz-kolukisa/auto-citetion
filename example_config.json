@@ -24,5 +24,10 @@
 
   "arxiv_queries": [
     "all:\"your keyword\" AND all:\"another\" AND cat:cs.CV"
+  ],
+
+  "dblp_venues": [
+    ["NeurIPS", 2024],
+    ["CVPR", 2025]
   ]
 }

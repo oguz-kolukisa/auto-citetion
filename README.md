@@ -10,10 +10,12 @@ config.json → Search (7 strategies) → Recursive Expansion → Score & Filter
 
 After the initial search, the tool **recursively expands**: it takes the top-scoring papers, crawls their citations and similar papers, scores those, and repeats — up to 3 rounds deep. This snowball effect catches papers that keyword search alone would miss.
 
-**Search strategies:**
+**Search strategies (5 APIs in parallel):**
 - Scholar Inbox semantic search + similar papers + refs/cited_by
 - Semantic Scholar keyword search + citation chains + author tracking
 - arXiv API search
+- OpenAlex semantic search + cited-by chains
+- DBLP keyword search + venue scanning (e.g. all NeurIPS 2024 papers)
 
 **LLM evaluation** (gemma-4-E4B-it by default):
 - Verdict: must_cite / should_cite / maybe_cite / skip
@@ -100,7 +102,8 @@ results/
   "semantic_scholar_queries": ["keyword combinations"],
   "seed_arxiv_ids": ["2004.07780"],
   "key_authors": ["Author Name"],
-  "arxiv_queries": ["all:\"keyword\" AND cat:cs.CV"]
+  "arxiv_queries": ["all:\"keyword\" AND cat:cs.CV"],
+  "dblp_venues": [["NeurIPS", 2024], ["CVPR", 2025]]
 }
 ```
 

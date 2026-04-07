@@ -7,7 +7,8 @@ import sys
 
 from search import Paper
 
-PROMPT = """You are evaluating whether a candidate paper should be cited in a research paper.
+PROMPT = """You are a strict academic reviewer evaluating whether a candidate paper should be cited.
+You must distribute your verdicts — not everything is "should_cite".
 
 RESEARCH PAPER:
 {context}
@@ -18,17 +19,39 @@ Authors: {authors}
 Year: {year}
 Abstract: {abstract}
 
-Respond in EXACTLY this JSON format (no other text):
+EXAMPLES of correct verdicts:
+
+Example 1 — must_cite (score 9):
+Paper about "using VLMs to generate counterfactual explanations for classifiers" → must_cite
+because it does nearly the same thing as our paper.
+
+Example 2 — should_cite (score 7):
+Paper about "diffusion-based counterfactual image generation" → should_cite
+because it's a method component we use, but doesn't address bias discovery.
+
+Example 3 — maybe_cite (score 4):
+Paper about "data augmentation with CutMix for robustness" → maybe_cite
+because it's tangentially related to our augmentation contribution but uses a different approach.
+
+Example 4 — skip (score 2):
+Paper about "adversarial robustness certification for neural networks" → skip
+because adversarial robustness is a different problem from spurious correlations.
+
+VERDICT CRITERIA (be strict):
+- "must_cite" (score 8-10): Does the SAME thing, is foundational to our method, or directly competes. Max ~10-15% of papers.
+- "should_cite" (score 5-7): Relevant related work in our problem space. ~30-40% of papers.
+- "maybe_cite" (score 3-4): Tangentially related, cite only if space permits. ~30-40% of papers.
+- "skip" (score 1-2): Different problem or too distant. ~20-30% of papers.
+
+Respond in EXACTLY this JSON (no other text):
 {{
   "verdict": "must_cite" | "should_cite" | "maybe_cite" | "skip",
   "relevance_score": <1-10>,
   "relationship": "<similar_method|builds_upon|we_build_upon|same_problem|competing_approach|foundational|supports_claim|provides_benchmark|tangentially_related>",
   "cite_in_sections": ["<section1>", "<section2>"],
   "reasoning": "<2-3 sentences>",
-  "differentiation": "<1 sentence if similar, else empty>"
-}}
-
-Be strict: "must_cite" only for very similar or foundational work. "skip" for tangential papers."""
+  "differentiation": "<1 sentence if similar_method or competing_approach, else empty string>"
+}}"""
 
 
 class LLMEvaluator:
@@ -63,24 +86,11 @@ class LLMEvaluator:
         )
         inputs = self._proc(text=text, return_tensors="pt").to(self._model.device)
         n = inputs["input_ids"].shape[-1]
-        out = self._model.generate(**inputs, max_new_tokens=512, temperature=0.3, top_p=0.9, do_sample=True)
+        out = self._model.generate(
+            **inputs, max_new_tokens=512, temperature=0.2, top_p=0.9, do_sample=True,
+        )
         resp = self._proc.decode(out[0][n:], skip_special_tokens=True).strip()
-
-        start, end = resp.find("{"), resp.rfind("}") + 1
-        if start >= 0 and end > 0:
-            try:
-                d = json.loads(resp[start:end])
-                paper.llm_verdict = d.get("verdict", "skip")
-                paper.llm_score = int(d.get("relevance_score", 0))
-                paper.llm_relationship = d.get("relationship", "")
-                paper.llm_sections = d.get("cite_in_sections", [])
-                paper.llm_reasoning = d.get("reasoning", "")
-                paper.llm_differentiation = d.get("differentiation", "")
-                return
-            except (json.JSONDecodeError, ValueError):
-                pass
-        paper.llm_verdict = "error"
-        paper.llm_reasoning = f"Parse failed: {resp[:200]}"
+        self._parse_into(paper, resp)
 
     def evaluate_batch(self, papers: list[Paper], context: str) -> None:
         for i, p in enumerate(papers):
@@ -99,3 +109,20 @@ class LLMEvaluator:
             import torch
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+    def _parse_into(self, paper: Paper, resp: str) -> None:
+        start, end = resp.find("{"), resp.rfind("}") + 1
+        if start >= 0 and end > 0:
+            try:
+                d = json.loads(resp[start:end])
+                paper.llm_verdict = d.get("verdict", "skip")
+                paper.llm_score = int(d.get("relevance_score", 0))
+                paper.llm_relationship = d.get("relationship", "")
+                paper.llm_sections = d.get("cite_in_sections", [])
+                paper.llm_reasoning = d.get("reasoning", "")
+                paper.llm_differentiation = d.get("differentiation", "")
+                return
+            except (json.JSONDecodeError, ValueError):
+                pass
+        paper.llm_verdict = "error"
+        paper.llm_reasoning = f"Parse failed: {resp[:200]}"

@@ -20,10 +20,12 @@ from search import (
     Paper, PaperPool, score_and_categorize,
     ss_keyword, ss_citations, ss_authors,
     si_semantic, si_similar, si_detail, si_collect_ids,
-    arxiv_search, run_parallel_apis,
+    arxiv_search, oalex_search, oalex_cited_by, dblp_search, dblp_venues,
+    run_parallel_apis,
     _job_ss_keyword, _job_ss_citations, _job_ss_author,
     _job_si_semantic, _job_si_similar, _job_si_detail,
-    _job_arxiv,
+    _job_arxiv, _job_oalex_search, _job_oalex_cited_by,
+    _job_dblp_search, _job_dblp_venue,
 )
 from evaluate import LLMEvaluator
 
@@ -286,8 +288,23 @@ def main():
         for i, q in enumerate(cfg.get("arxiv_queries", [])):
             arxiv_jobs.append(lambda q=q, i=i: _job_arxiv(q, i))
 
-        print(f"\nJobs queued: SS={len(ss_jobs)} SI={len(si_jobs)} arXiv={len(arxiv_jobs)}", file=sys.stderr)
-        run_parallel_apis(pool, ss_jobs, si_jobs, arxiv_jobs)
+        # OpenAlex jobs — reuse SS keyword queries + seed citation chains
+        oalex_jobs = []
+        for i, q in enumerate(cfg.get("semantic_scholar_queries", [])):
+            oalex_jobs.append(lambda q=q, i=i: _job_oalex_search(q, i))
+        for aid in cfg.get("seed_arxiv_ids", []):
+            oalex_jobs.append(lambda a=aid: _job_oalex_cited_by(a))
+
+        # DBLP jobs — keyword queries + venue scans
+        dblp_jobs = []
+        for i, q in enumerate(cfg.get("semantic_scholar_queries", [])):
+            dblp_jobs.append(lambda q=q, i=i: _job_dblp_search(q, i))
+        for venue, year in cfg.get("dblp_venues", []):
+            dblp_jobs.append(lambda v=venue, y=year: _job_dblp_venue(v, y))
+
+        print(f"\nJobs: SS={len(ss_jobs)} SI={len(si_jobs)} arXiv={len(arxiv_jobs)} "
+              f"OpenAlex={len(oalex_jobs)} DBLP={len(dblp_jobs)}", file=sys.stderr)
+        run_parallel_apis(pool, ss_jobs, si_jobs, arxiv_jobs, oalex_jobs, dblp_jobs)
         print(f"\nInitial pool: {pool.size}", file=sys.stderr)
 
         # Stage 1.5: Recursive expansion

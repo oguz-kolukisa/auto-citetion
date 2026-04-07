@@ -1,12 +1,15 @@
-"""Paper search across Semantic Scholar, Scholar Inbox, and arXiv.
+"""Paper search across Semantic Scholar, Scholar Inbox, arXiv, OpenAlex, and DBLP.
 
 Uses a concurrent job scheduler with per-API rate limiters so that
 when one API is rate-limited, the others keep running.
+Includes disk caching to avoid re-fetching on reruns.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import sys
 import threading
 import time
@@ -15,7 +18,28 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from pathlib import Path
 from urllib.parse import quote
+
+# ── Disk cache ────────────────────────────────────────────────────────────
+
+CACHE_DIR = Path(os.environ.get("AUTOCITE_CACHE", Path.home() / ".cache" / "auto-citetion"))
+
+
+def _cache_key(url: str, body: str = "") -> str:
+    return hashlib.md5((url + body).encode()).hexdigest()
+
+
+def _cache_get(url: str, body: str = "") -> bytes | None:
+    path = CACHE_DIR / _cache_key(url, body)
+    if path.exists() and (time.time() - path.stat().st_mtime) < 86400:  # 24h TTL
+        return path.read_bytes()
+    return None
+
+
+def _cache_set(url: str, data: bytes, body: str = "") -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    (CACHE_DIR / _cache_key(url, body)).write_bytes(data)
 
 
 # ── Data model ────────────────────────────────────────────────────────────
@@ -49,24 +73,52 @@ class Paper:
 
 
 class PaperPool:
-    """Thread-safe deduplicating paper collection."""
+    """Thread-safe deduplicating paper collection.
+    Deduplicates by title (fuzzy) and arXiv ID."""
 
     def __init__(self):
         self._papers: dict[str, Paper] = {}
+        self._arxiv_index: dict[str, str] = {}  # arxiv_id -> title key
         self._lock = threading.Lock()
+
+    def _find_existing(self, p: Paper) -> str | None:
+        """Check if paper already exists by arXiv ID or fuzzy title."""
+        if p.arxiv_id and p.arxiv_id in self._arxiv_index:
+            return self._arxiv_index[p.arxiv_id]
+        key = p.title.lower().strip()
+        if key in self._papers:
+            return key
+        # Fuzzy title match
+        title_words = set(key.split())
+        for existing_key in self._papers:
+            existing_words = set(existing_key.split())
+            overlap = len(title_words & existing_words) / max(len(title_words | existing_words), 1)
+            if overlap > 0.7:
+                return existing_key
+        return None
 
     def add(self, p: Paper, source: str) -> bool:
         key = p.title.lower().strip()
         if not key:
             return False
         with self._lock:
-            if key in self._papers:
-                self._papers[key].sources.append(source)
-                self._papers[key].source_count += 1
+            existing = self._find_existing(p)
+            if existing:
+                self._papers[existing].sources.append(source)
+                self._papers[existing].source_count += 1
+                # Merge arXiv ID if the existing one doesn't have it
+                if p.arxiv_id and not self._papers[existing].arxiv_id:
+                    self._papers[existing].arxiv_id = p.arxiv_id
+                    self._arxiv_index[p.arxiv_id] = existing
+                # Merge abstract if existing one is empty
+                if p.abstract and not self._papers[existing].abstract:
+                    self._papers[existing].abstract = p.abstract
                 return False
             p.sources = [source]
             p.source_count = 1
             self._papers[key] = p
+            if p.arxiv_id:
+                self._arxiv_index[p.arxiv_id] = key
             return True
 
     def add_many(self, papers: list[Paper], source: str) -> int:
@@ -102,14 +154,19 @@ class RateLimiter:
 
 
 # One limiter per API — they don't block each other
-_ss_limiter = RateLimiter(1.0)   # SS shared rate limit is strict
+_ss_limiter = RateLimiter(1.0)
 _si_limiter = RateLimiter(1.5)
 _arxiv_limiter = RateLimiter(3.0)
+_oalex_limiter = RateLimiter(0.2)   # OpenAlex is generous: 10 req/s
+_dblp_limiter = RateLimiter(1.0)
 
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────
 
 def _get(url: str, headers: dict | None = None, limiter: RateLimiter | None = None) -> bytes | None:
+    cached = _cache_get(url)
+    if cached:
+        return cached
     if limiter:
         limiter.wait()
     try:
@@ -118,7 +175,9 @@ def _get(url: str, headers: dict | None = None, limiter: RateLimiter | None = No
         for k, v in (headers or {}).items():
             req.add_header(k, v)
         with urllib.request.urlopen(req, timeout=20) as r:
-            return r.read()
+            data = r.read()
+            _cache_set(url, data)
+            return data
     except urllib.error.HTTPError as e:
         if e.code == 429:
             print(f"    429 on {url[:50]}… backoff 15s", file=sys.stderr)
@@ -131,17 +190,23 @@ def _get(url: str, headers: dict | None = None, limiter: RateLimiter | None = No
 
 def _post(url: str, data: dict, headers: dict | None = None,
           limiter: RateLimiter | None = None) -> dict | None:
+    body_str = json.dumps(data)
+    cached = _cache_get(url, body_str)
+    if cached:
+        return json.loads(cached.decode())
     if limiter:
         limiter.wait()
     try:
-        body = json.dumps(data).encode()
+        body = body_str.encode()
         req = urllib.request.Request(url, data=body, method="POST")
         req.add_header("Content-Type", "application/json")
         req.add_header("User-Agent", "auto-citetion/1.0")
         for k, v in (headers or {}).items():
             req.add_header(k, v)
         with urllib.request.urlopen(req, timeout=30) as r:
-            return json.loads(r.read().decode())
+            resp_data = r.read()
+            _cache_set(url, resp_data, body_str)
+            return json.loads(resp_data.decode())
     except urllib.error.HTTPError as e:
         if e.code == 429:
             time.sleep(15)
@@ -308,6 +373,121 @@ def _job_arxiv(query: str, idx: int) -> tuple[list[Paper], str]:
     return papers, f"arxiv:{idx}"
 
 
+# ── OpenAlex jobs ─────────────────────────────────────────────────────────
+
+OA = "https://api.openalex.org"
+
+
+def _parse_oalex(d: dict) -> Paper | None:
+    if not d or not d.get("title"):
+        return None
+    au_list = d.get("authorships") or []
+    names = ", ".join(
+        a.get("author", {}).get("display_name", "") for a in au_list[:4]
+    )
+    if len(au_list) > 4:
+        names += " et al."
+    year = str(d.get("publication_year") or "")
+    venue = ""
+    loc = d.get("primary_location") or {}
+    src = loc.get("source") or {}
+    if src.get("display_name"):
+        venue = src["display_name"]
+    arxiv_id = ""
+    ids = d.get("ids") or {}
+    if ids.get("openalex"):
+        pass  # we want arxiv
+    doi = d.get("doi") or ""
+    # Try to extract arxiv from locations
+    for location in d.get("locations") or []:
+        landing = location.get("landing_page_url") or ""
+        if "arxiv.org/abs/" in landing:
+            arxiv_id = landing.split("/abs/")[-1].split("v")[0]
+            break
+    abstract = ""
+    inv_index = d.get("abstract_inverted_index")
+    if inv_index:
+        words: dict[int, str] = {}
+        for word, positions in inv_index.items():
+            for pos in positions:
+                words[pos] = word
+        abstract = " ".join(words[i] for i in sorted(words))
+    return Paper(
+        title=d["title"], authors=names, year=year, venue=venue,
+        arxiv_id=arxiv_id, citation_count=d.get("cited_by_count") or 0,
+        abstract=abstract,
+    )
+
+
+def _job_oalex_search(query: str, idx: int) -> tuple[list[Paper], str]:
+    url = f"{OA}/works?search={quote(query)}&per_page=25&sort=relevance_score:desc"
+    raw = _get(url, limiter=_oalex_limiter)
+    if not raw:
+        return [], f"oalex:{idx}"
+    data = json.loads(raw.decode())
+    papers = [p for d in data.get("results", []) if (p := _parse_oalex(d))]
+    return papers, f"oalex:{idx}"
+
+
+def _job_oalex_cited_by(arxiv_id: str) -> tuple[list[Paper], str]:
+    url = f"{OA}/works?filter=cites:https://arxiv.org/abs/{arxiv_id}&per_page=50&sort=cited_by_count:desc"
+    raw = _get(url, limiter=_oalex_limiter)
+    if not raw:
+        return [], f"oalex_cite:{arxiv_id}"
+    data = json.loads(raw.decode())
+    papers = [p for d in data.get("results", []) if (p := _parse_oalex(d))]
+    return papers, f"oalex_cite:{arxiv_id}"
+
+
+# ── DBLP jobs ─────────────────────────────────────────────────────────────
+
+DBLP = "https://dblp.org/search/publ/api"
+
+
+def _parse_dblp(hit: dict) -> Paper | None:
+    info = hit.get("info", {})
+    title = info.get("title", "")
+    if not title:
+        return None
+    authors_raw = info.get("authors", {}).get("author", [])
+    if isinstance(authors_raw, dict):
+        authors_raw = [authors_raw]
+    names = ", ".join(
+        (a.get("text", a) if isinstance(a, dict) else str(a)) for a in authors_raw[:4]
+    )
+    if len(authors_raw) > 4:
+        names += " et al."
+    return Paper(
+        title=title.rstrip("."), authors=names,
+        year=str(info.get("year", "")),
+        venue=info.get("venue", ""),
+        abstract="",  # DBLP doesn't have abstracts
+    )
+
+
+def _job_dblp_search(query: str, idx: int) -> tuple[list[Paper], str]:
+    url = f"{DBLP}?q={quote(query)}&format=json&h=30"
+    raw = _get(url, limiter=_dblp_limiter)
+    if not raw:
+        return [], f"dblp:{idx}"
+    data = json.loads(raw.decode())
+    hits = data.get("result", {}).get("hits", {}).get("hit", [])
+    papers = [p for h in hits if (p := _parse_dblp(h))]
+    return papers, f"dblp:{idx}"
+
+
+def _job_dblp_venue(venue: str, year: int) -> tuple[list[Paper], str]:
+    """Search for papers from a specific venue+year (e.g. NeurIPS 2024)."""
+    url = f"{DBLP}?q=venue:{quote(venue)}+year:{year}&format=json&h=100"
+    raw = _get(url, limiter=_dblp_limiter)
+    if not raw:
+        return [], f"dblp_venue:{venue}:{year}"
+    data = json.loads(raw.decode())
+    hits = data.get("result", {}).get("hits", {}).get("hit", [])
+    papers = [p for h in hits if (p := _parse_dblp(h))]
+    return papers, f"dblp_venue:{venue}:{year}"
+
+
 # ── Job scheduler ─────────────────────────────────────────────────────────
 
 def run_jobs(pool: PaperPool, jobs: list, max_workers: int = 2) -> None:
@@ -331,15 +511,19 @@ def run_jobs(pool: PaperPool, jobs: list, max_workers: int = 2) -> None:
 
 def run_parallel_apis(pool: PaperPool,
                       ss_jobs: list = None, si_jobs: list = None,
-                      arxiv_jobs: list = None) -> None:
-    """Run jobs across all 3 APIs truly in parallel.
-    Each API gets its own single-thread executor so rate limiters
-    serialize within an API, but different APIs overlap."""
+                      arxiv_jobs: list = None, oalex_jobs: list = None,
+                      dblp_jobs: list = None) -> None:
+    """Run jobs across all APIs truly in parallel.
+    Each API gets its own thread so rate limiters serialize within
+    an API, but different APIs overlap."""
     ss_jobs = ss_jobs or []
     si_jobs = si_jobs or []
     arxiv_jobs = arxiv_jobs or []
-    total = len(ss_jobs) + len(si_jobs) + len(arxiv_jobs)
-    print(f"  Running {total} jobs across 3 APIs in parallel", file=sys.stderr)
+    oalex_jobs = oalex_jobs or []
+    dblp_jobs = dblp_jobs or []
+    total = len(ss_jobs) + len(si_jobs) + len(arxiv_jobs) + len(oalex_jobs) + len(dblp_jobs)
+    apis = sum(1 for j in [ss_jobs, si_jobs, arxiv_jobs, oalex_jobs, dblp_jobs] if j)
+    print(f"  Running {total} jobs across {apis} APIs in parallel", file=sys.stderr)
     done = [0]
     lock = threading.Lock()
 
@@ -359,15 +543,10 @@ def run_parallel_apis(pool: PaperPool,
                     print(f"  [{done[0]}/{total}] {label} error: {e}", file=sys.stderr)
 
     threads = []
-    if ss_jobs:
-        t = threading.Thread(target=_run_batch, args=(ss_jobs, "SS"), daemon=True)
-        threads.append(t)
-    if si_jobs:
-        t = threading.Thread(target=_run_batch, args=(si_jobs, "SI"), daemon=True)
-        threads.append(t)
-    if arxiv_jobs:
-        t = threading.Thread(target=_run_batch, args=(arxiv_jobs, "arXiv"), daemon=True)
-        threads.append(t)
+    for jobs, label in [(ss_jobs, "SS"), (si_jobs, "SI"), (arxiv_jobs, "arXiv"),
+                        (oalex_jobs, "OpenAlex"), (dblp_jobs, "DBLP")]:
+        if jobs:
+            threads.append(threading.Thread(target=_run_batch, args=(jobs, label), daemon=True))
 
     for t in threads:
         t.start()
@@ -416,6 +595,31 @@ def si_detail(pool: PaperPool, paper_ids: list[int], cookie: str) -> None:
 def arxiv_search(pool: PaperPool, queries: list[str]) -> None:
     print("\n[arXiv] search", file=sys.stderr)
     jobs = [lambda q=q, i=i: _job_arxiv(q, i) for i, q in enumerate(queries)]
+    run_jobs(pool, jobs)
+
+
+def oalex_search(pool: PaperPool, queries: list[str]) -> None:
+    print("\n[OpenAlex] search", file=sys.stderr)
+    jobs = [lambda q=q, i=i: _job_oalex_search(q, i) for i, q in enumerate(queries)]
+    run_jobs(pool, jobs)
+
+
+def oalex_cited_by(pool: PaperPool, arxiv_ids: list[str]) -> None:
+    print("\n[OpenAlex] cited-by chains", file=sys.stderr)
+    jobs = [lambda a=a: _job_oalex_cited_by(a) for a in arxiv_ids]
+    run_jobs(pool, jobs)
+
+
+def dblp_search(pool: PaperPool, queries: list[str]) -> None:
+    print("\n[DBLP] search", file=sys.stderr)
+    jobs = [lambda q=q, i=i: _job_dblp_search(q, i) for i, q in enumerate(queries)]
+    run_jobs(pool, jobs)
+
+
+def dblp_venues(pool: PaperPool, venues: list[tuple[str, int]]) -> None:
+    """Search specific venue+year combos, e.g. [("NeurIPS", 2024), ("CVPR", 2025)]."""
+    print("\n[DBLP] venue scan", file=sys.stderr)
+    jobs = [lambda v=v, y=y: _job_dblp_venue(v, y) for v, y in venues]
     run_jobs(pool, jobs)
 
 
