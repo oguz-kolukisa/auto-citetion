@@ -19,29 +19,21 @@ Authors: {authors}
 Year: {year}
 Abstract: {abstract}
 
-EXAMPLES of correct verdicts:
+EXAMPLES:
 
-Example 1 — must_cite (score 9):
-Paper about "using VLMs to generate counterfactual explanations for classifiers" → must_cite
-because it does nearly the same thing as our paper.
+must_cite (9/10): "using VLMs to generate counterfactual explanations for classifiers"
+→ Nearly identical to our method.
 
-Example 2 — should_cite (score 7):
-Paper about "diffusion-based counterfactual image generation" → should_cite
-because it's a method component we use, but doesn't address bias discovery.
+should_cite (7/10): "diffusion-based counterfactual image generation"
+→ A method component we use, but doesn't address bias discovery.
 
-Example 3 — maybe_cite (score 4):
-Paper about "data augmentation with CutMix for robustness" → maybe_cite
-because it's tangentially related to our augmentation contribution but uses a different approach.
+maybe_cite (4/10): "data augmentation with CutMix for robustness"
+→ Tangentially related to our augmentation contribution.
 
-Example 4 — skip (score 2):
-Paper about "adversarial robustness certification for neural networks" → skip
-because adversarial robustness is a different problem from spurious correlations.
+skip (2/10): "adversarial robustness certification for neural networks"
+→ Different problem from spurious correlations.
 
-VERDICT CRITERIA (be strict):
-- "must_cite" (score 8-10): Does the SAME thing, is foundational to our method, or directly competes. Max ~10-15% of papers.
-- "should_cite" (score 5-7): Relevant related work in our problem space. ~30-40% of papers.
-- "maybe_cite" (score 3-4): Tangentially related, cite only if space permits. ~30-40% of papers.
-- "skip" (score 1-2): Different problem or too distant. ~20-30% of papers.
+DISTRIBUTION: ~10-15% must_cite, ~30-40% should_cite, ~30-40% maybe_cite, ~20-30% skip.
 
 Respond in EXACTLY this JSON (no other text):
 {{
@@ -50,7 +42,7 @@ Respond in EXACTLY this JSON (no other text):
   "relationship": "<similar_method|builds_upon|we_build_upon|same_problem|competing_approach|foundational|supports_claim|provides_benchmark|tangentially_related>",
   "cite_in_sections": ["<section1>", "<section2>"],
   "reasoning": "<2-3 sentences>",
-  "differentiation": "<1 sentence if similar_method or competing_approach, else empty string>"
+  "differentiation": "<1 sentence if similar, else empty>"
 }}"""
 
 
@@ -59,7 +51,7 @@ class LLMEvaluator:
     def __init__(self, model_id: str = "google/gemma-4-E4B-it"):
         self.model_id = model_id
         self._model = None
-        self._proc = None
+        self._processor = None
 
     def load(self) -> None:
         if self._model:
@@ -67,62 +59,74 @@ class LLMEvaluator:
         print(f"Loading {self.model_id}…", file=sys.stderr)
         from transformers import AutoModelForCausalLM, AutoProcessor
         import torch
-
-        self._proc = AutoProcessor.from_pretrained(self.model_id)
+        self._processor = AutoProcessor.from_pretrained(self.model_id)
         self._model = AutoModelForCausalLM.from_pretrained(
             self.model_id, dtype=torch.bfloat16, device_map="auto",
         )
         print(f"Loaded on {self._model.device}", file=sys.stderr)
 
-    def evaluate(self, paper: Paper, context: str) -> None:
+    def evaluate_batch(self, papers: list[Paper], context: str) -> None:
+        for i, paper in enumerate(papers):
+            print(f"  [{i+1}/{len(papers)}] {paper.title[:60]}…", file=sys.stderr)
+            self._evaluate_single(paper, context)
+
+    def unload(self) -> None:
+        if not self._model:
+            return
+        del self._model, self._processor
+        self._model = self._processor = None
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _evaluate_single(self, paper: Paper, context: str) -> None:
+        try:
+            response = self._generate(paper, context)
+            self._parse_response(paper, response)
+        except Exception as e:
+            print(f"    error: {e}", file=sys.stderr)
+            paper.llm_verdict = "error"
+            paper.llm_reasoning = str(e)
+
+    def _generate(self, paper: Paper, context: str) -> str:
         self.load()
         prompt = PROMPT.format(
             context=context, title=paper.title, authors=paper.authors,
             year=paper.year, abstract=paper.abstract[:1500],
         )
         messages = [{"role": "user", "content": prompt}]
-        text = self._proc.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False,
+        text = self._processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+            enable_thinking=False,
         )
-        inputs = self._proc(text=text, return_tensors="pt").to(self._model.device)
-        n = inputs["input_ids"].shape[-1]
-        out = self._model.generate(
-            **inputs, max_new_tokens=512, temperature=0.2, top_p=0.9, do_sample=True,
+        inputs = self._processor(text=text, return_tensors="pt").to(self._model.device)
+        input_len = inputs["input_ids"].shape[-1]
+        outputs = self._model.generate(
+            **inputs, max_new_tokens=512, temperature=0.2,
+            top_p=0.9, do_sample=True,
         )
-        resp = self._proc.decode(out[0][n:], skip_special_tokens=True).strip()
-        self._parse_into(paper, resp)
+        return self._processor.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
 
-    def evaluate_batch(self, papers: list[Paper], context: str) -> None:
-        for i, p in enumerate(papers):
-            print(f"  [{i+1}/{len(papers)}] {p.title[:60]}…", file=sys.stderr)
-            try:
-                self.evaluate(p, context)
-            except Exception as e:
-                print(f"    error: {e}", file=sys.stderr)
-                p.llm_verdict = "error"
-                p.llm_reasoning = str(e)
+    def _parse_response(self, paper: Paper, response: str) -> None:
+        data = _extract_json(response)
+        if not data:
+            paper.llm_verdict = "error"
+            paper.llm_reasoning = f"Parse failed: {response[:200]}"
+            return
+        paper.llm_verdict = data.get("verdict", "skip")
+        paper.llm_score = int(data.get("relevance_score", 0))
+        paper.llm_relationship = data.get("relationship", "")
+        paper.llm_sections = data.get("cite_in_sections", [])
+        paper.llm_reasoning = data.get("reasoning", "")
+        paper.llm_differentiation = data.get("differentiation", "")
 
-    def unload(self) -> None:
-        if self._model:
-            del self._model, self._proc
-            self._model = self._proc = None
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
-    def _parse_into(self, paper: Paper, resp: str) -> None:
-        start, end = resp.find("{"), resp.rfind("}") + 1
-        if start >= 0 and end > 0:
-            try:
-                d = json.loads(resp[start:end])
-                paper.llm_verdict = d.get("verdict", "skip")
-                paper.llm_score = int(d.get("relevance_score", 0))
-                paper.llm_relationship = d.get("relationship", "")
-                paper.llm_sections = d.get("cite_in_sections", [])
-                paper.llm_reasoning = d.get("reasoning", "")
-                paper.llm_differentiation = d.get("differentiation", "")
-                return
-            except (json.JSONDecodeError, ValueError):
-                pass
-        paper.llm_verdict = "error"
-        paper.llm_reasoning = f"Parse failed: {resp[:200]}"
+def _extract_json(text: str) -> dict | None:
+    start = text.find("{")
+    end = text.rfind("}") + 1
+    if start < 0 or end <= 0:
+        return None
+    try:
+        return json.loads(text[start:end])
+    except (json.JSONDecodeError, ValueError):
+        return None

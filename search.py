@@ -1,8 +1,7 @@
 """Paper search across Semantic Scholar, Scholar Inbox, arXiv, OpenAlex, and DBLP.
 
-Uses a concurrent job scheduler with per-API rate limiters so that
-when one API is rate-limited, the others keep running.
-Includes disk caching to avoid re-fetching on reruns.
+Each API runs in its own thread with its own rate limiter.
+Disk cache avoids re-fetching on reruns.
 """
 
 from __future__ import annotations
@@ -16,33 +15,58 @@ import time
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import quote
 
-# ── Disk cache ────────────────────────────────────────────────────────────
+# ── Constants ─────────────────────────────────────────────────────────────
+
+SS_BASE = "https://api.semanticscholar.org/graph/v1"
+SS_FIELDS = "paperId,externalIds,title,year,venue,citationCount,abstract,authors"
+SI_BASE = "https://api.scholar-inbox.com/api"
+OA_BASE = "https://api.openalex.org"
+DBLP_BASE = "https://dblp.org/search/publ/api"
+ARXIV_BASE = "http://export.arxiv.org/api/query"
+ARXIV_NS = "{http://www.w3.org/2005/Atom}"
 
 CACHE_DIR = Path(os.environ.get("AUTOCITE_CACHE", Path.home() / ".cache" / "auto-citetion"))
+CACHE_TTL = 86400
+
+TOP_VENUES = ["neurips", "icml", "iclr", "cvpr", "eccv", "iccv"]
+
+HIGH_KEYWORDS = [
+    "spurious correlation", "shortcut learning", "counterfactual explanation",
+    "counterfactual image", "bias discovery", "feature discovery", "model diagnosis",
+    "vision-language model", "attention map", "grad-cam", "score-cam",
+    "counterfactual generation", "semantic feature", "concept discovery",
+]
+MED_KEYWORDS = [
+    "explainability", "interpretability", "debiasing", "group robustness",
+    "diffusion", "image editing", "saliency", "concept-based", "attribution",
+    "vlm", "multimodal",
+]
+LOW_KEYWORDS = [
+    "robustness", "distribution shift", "imagenet", "augmentation", "causal",
+    "classifier",
+]
+CATEGORIES = {
+    "similar_method": ["counterfactual", "feature discovery", "bias discovery",
+                       "model diagnosis", "attention map"],
+    "counterfactual_xai": ["counterfactual explanation", "counterfactual image",
+                           "counterfactual generation"],
+    "shortcut_spurious": ["spurious correlation", "shortcut learning",
+                          "group robustness", "debiasing"],
+    "vlm_multimodal": ["vision-language", "vlm", "multimodal", "clip",
+                       "large language model"],
+    "diffusion_editing": ["diffusion", "image editing", "text-guided",
+                          "generative model"],
+    "explainability": ["explainability", "interpretability", "attribution",
+                       "grad-cam", "score-cam", "saliency"],
+    "augmentation": ["augmentation", "data augmentation", "synthetic data"],
+}
 
 
-def _cache_key(url: str, body: str = "") -> str:
-    return hashlib.md5((url + body).encode()).hexdigest()
-
-
-def _cache_get(url: str, body: str = "") -> bytes | None:
-    path = CACHE_DIR / _cache_key(url, body)
-    if path.exists() and (time.time() - path.stat().st_mtime) < 86400:  # 24h TTL
-        return path.read_bytes()
-    return None
-
-
-def _cache_set(url: str, data: bytes, body: str = "") -> None:
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    (CACHE_DIR / _cache_key(url, body)).write_bytes(data)
-
-
-# ── Data model ────────────────────────────────────────────────────────────
+# ── Paper ─────────────────────────────────────────────────────────────────
 
 @dataclass
 class Paper:
@@ -72,53 +96,26 @@ class Paper:
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
 
 
+# ── Paper pool ────────────────────────────────────────────────────────────
+
 class PaperPool:
-    """Thread-safe deduplicating paper collection.
-    Deduplicates by title (fuzzy) and arXiv ID."""
+    """Thread-safe collection that deduplicates by arXiv ID and fuzzy title."""
 
     def __init__(self):
         self._papers: dict[str, Paper] = {}
-        self._arxiv_index: dict[str, str] = {}  # arxiv_id -> title key
+        self._arxiv_index: dict[str, str] = {}
         self._lock = threading.Lock()
 
-    def _find_existing(self, p: Paper) -> str | None:
-        """Check if paper already exists by arXiv ID or fuzzy title."""
-        if p.arxiv_id and p.arxiv_id in self._arxiv_index:
-            return self._arxiv_index[p.arxiv_id]
-        key = p.title.lower().strip()
-        if key in self._papers:
-            return key
-        # Fuzzy title match
-        title_words = set(key.split())
-        for existing_key in self._papers:
-            existing_words = set(existing_key.split())
-            overlap = len(title_words & existing_words) / max(len(title_words | existing_words), 1)
-            if overlap > 0.7:
-                return existing_key
-        return None
-
-    def add(self, p: Paper, source: str) -> bool:
-        key = p.title.lower().strip()
+    def add(self, paper: Paper, source: str) -> bool:
+        key = paper.title.lower().strip()
         if not key:
             return False
         with self._lock:
-            existing = self._find_existing(p)
-            if existing:
-                self._papers[existing].sources.append(source)
-                self._papers[existing].source_count += 1
-                # Merge arXiv ID if the existing one doesn't have it
-                if p.arxiv_id and not self._papers[existing].arxiv_id:
-                    self._papers[existing].arxiv_id = p.arxiv_id
-                    self._arxiv_index[p.arxiv_id] = existing
-                # Merge abstract if existing one is empty
-                if p.abstract and not self._papers[existing].abstract:
-                    self._papers[existing].abstract = p.abstract
+            existing_key = self._find_duplicate(paper, key)
+            if existing_key:
+                self._merge_into_existing(existing_key, paper, source)
                 return False
-            p.sources = [source]
-            p.source_count = 1
-            self._papers[key] = p
-            if p.arxiv_id:
-                self._arxiv_index[p.arxiv_id] = key
+            self._insert_new(key, paper, source)
             return True
 
     def add_many(self, papers: list[Paper], source: str) -> int:
@@ -133,87 +130,141 @@ class PaperPool:
         with self._lock:
             return list(self._papers.values())
 
+    def _find_duplicate(self, paper: Paper, key: str) -> str | None:
+        if paper.arxiv_id and paper.arxiv_id in self._arxiv_index:
+            return self._arxiv_index[paper.arxiv_id]
+        if key in self._papers:
+            return key
+        return self._find_fuzzy_match(key)
 
-# ── Per-API rate limiters ─────────────────────────────────────────────────
+    def _find_fuzzy_match(self, key: str) -> str | None:
+        words = set(key.split())
+        for existing_key in self._papers:
+            overlap = len(words & set(existing_key.split()))
+            union = len(words | set(existing_key.split()))
+            if overlap / max(union, 1) > 0.7:
+                return existing_key
+        return None
+
+    def _merge_into_existing(self, key: str, paper: Paper, source: str) -> None:
+        existing = self._papers[key]
+        existing.sources.append(source)
+        existing.source_count += 1
+        if paper.arxiv_id and not existing.arxiv_id:
+            existing.arxiv_id = paper.arxiv_id
+            self._arxiv_index[paper.arxiv_id] = key
+        if paper.abstract and not existing.abstract:
+            existing.abstract = paper.abstract
+
+    def _insert_new(self, key: str, paper: Paper, source: str) -> None:
+        paper.sources = [source]
+        paper.source_count = 1
+        self._papers[key] = paper
+        if paper.arxiv_id:
+            self._arxiv_index[paper.arxiv_id] = key
+
+
+# ── Rate limiter ──────────────────────────────────────────────────────────
 
 class RateLimiter:
-    """Token-bucket rate limiter for a single API."""
-
-    def __init__(self, min_interval: float):
-        self._interval = min_interval
+    def __init__(self, interval: float):
+        self._interval = interval
         self._lock = threading.Lock()
         self._last = 0.0
 
     def wait(self) -> None:
         with self._lock:
-            now = time.monotonic()
-            elapsed = now - self._last
-            if elapsed < self._interval:
-                time.sleep(self._interval - elapsed)
+            delay = self._interval - (time.monotonic() - self._last)
+            if delay > 0:
+                time.sleep(delay)
             self._last = time.monotonic()
 
 
-# One limiter per API — they don't block each other
-_ss_limiter = RateLimiter(1.0)
-_si_limiter = RateLimiter(1.5)
-_arxiv_limiter = RateLimiter(3.0)
-_oalex_limiter = RateLimiter(0.2)   # OpenAlex is generous: 10 req/s
-_dblp_limiter = RateLimiter(1.0)
+_limiters = {
+    "ss": RateLimiter(1.0),
+    "si": RateLimiter(1.5),
+    "arxiv": RateLimiter(3.0),
+    "oalex": RateLimiter(0.2),
+    "dblp": RateLimiter(1.0),
+}
 
 
-# ── HTTP helpers ──────────────────────────────────────────────────────────
+# ── Disk cache ────────────────────────────────────────────────────────────
 
-def _get(url: str, headers: dict | None = None, limiter: RateLimiter | None = None) -> bytes | None:
-    cached = _cache_get(url)
+def _cache_path(url: str, body: str = "") -> Path:
+    digest = hashlib.md5((url + body).encode()).hexdigest()
+    return CACHE_DIR / digest
+
+
+def _read_cache(url: str, body: str = "") -> bytes | None:
+    path = _cache_path(url, body)
+    if path.exists() and (time.time() - path.stat().st_mtime) < CACHE_TTL:
+        return path.read_bytes()
+    return None
+
+
+def _write_cache(url: str, data: bytes, body: str = "") -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    _cache_path(url, body).write_bytes(data)
+
+
+# ── HTTP ──────────────────────────────────────────────────────────────────
+
+def _build_request(url: str, headers: dict | None, body: bytes | None) -> urllib.request.Request:
+    req = urllib.request.Request(url, data=body, method="POST" if body else "GET")
+    req.add_header("User-Agent", "auto-citetion/1.0")
+    if body:
+        req.add_header("Content-Type", "application/json")
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    return req
+
+
+def _fetch(url: str, headers: dict | None = None, body: bytes | None = None,
+           limiter: str | None = None) -> bytes | None:
+    body_str = body.decode() if body else ""
+    cached = _read_cache(url, body_str)
     if cached:
         return cached
     if limiter:
-        limiter.wait()
+        _limiters[limiter].wait()
     try:
-        req = urllib.request.Request(url)
-        req.add_header("User-Agent", "auto-citetion/1.0")
-        for k, v in (headers or {}).items():
-            req.add_header(k, v)
+        req = _build_request(url, headers, body)
         with urllib.request.urlopen(req, timeout=20) as r:
             data = r.read()
-            _cache_set(url, data)
-            return data
+        _write_cache(url, data, body_str)
+        return data
     except urllib.error.HTTPError as e:
         if e.code == 429:
-            print(f"    429 on {url[:50]}… backoff 15s", file=sys.stderr)
+            print(f"    429 backoff 15s…", file=sys.stderr)
             time.sleep(15)
-            return _get(url, headers, limiter)
+            return _fetch(url, headers, body, limiter)
         return None
     except Exception:
         return None
 
 
-def _post(url: str, data: dict, headers: dict | None = None,
-          limiter: RateLimiter | None = None) -> dict | None:
-    body_str = json.dumps(data)
-    cached = _cache_get(url, body_str)
-    if cached:
-        return json.loads(cached.decode())
-    if limiter:
-        limiter.wait()
-    try:
-        body = body_str.encode()
-        req = urllib.request.Request(url, data=body, method="POST")
-        req.add_header("Content-Type", "application/json")
-        req.add_header("User-Agent", "auto-citetion/1.0")
-        for k, v in (headers or {}).items():
-            req.add_header(k, v)
-        with urllib.request.urlopen(req, timeout=30) as r:
-            resp_data = r.read()
-            _cache_set(url, resp_data, body_str)
-            return json.loads(resp_data.decode())
-    except urllib.error.HTTPError as e:
-        if e.code == 429:
-            time.sleep(15)
-            return _post(url, data, headers, limiter)
+def _get_json(url: str, limiter: str, headers: dict | None = None) -> dict | None:
+    raw = _fetch(url, headers=headers, limiter=limiter)
+    if not raw:
         return None
-    except Exception:
+    return json.loads(raw.decode())
+
+
+def _post_json(url: str, data: dict, limiter: str, headers: dict | None = None) -> dict | None:
+    raw = _fetch(url, headers=headers, body=json.dumps(data).encode(), limiter=limiter)
+    if not raw:
         return None
+    return json.loads(raw.decode())
+
+
+# ── Author formatting ─────────────────────────────────────────────────────
+
+def _format_authors(names: list[str], limit: int = 4) -> str:
+    result = ", ".join(names[:limit])
+    if len(names) > limit:
+        result += " et al."
+    return result
 
 
 # ── Parsers ───────────────────────────────────────────────────────────────
@@ -222,226 +273,88 @@ def _parse_ss(d: dict) -> Paper | None:
     if not d or not d.get("title"):
         return None
     ext = d.get("externalIds") or {}
-    au = d.get("authors") or []
-    names = ", ".join(a.get("name", "") for a in au[:4])
-    if len(au) > 4:
-        names += " et al."
-    return Paper(title=d["title"], authors=names, year=str(d.get("year") or ""),
-                 venue=d.get("venue") or "", arxiv_id=ext.get("ArXiv", ""),
-                 citation_count=d.get("citationCount") or 0,
-                 abstract=d.get("abstract") or "")
+    names = [a.get("name", "") for a in (d.get("authors") or [])]
+    return Paper(
+        title=d["title"], authors=_format_authors(names),
+        year=str(d.get("year") or ""), venue=d.get("venue") or "",
+        arxiv_id=ext.get("ArXiv", ""),
+        citation_count=d.get("citationCount") or 0,
+        abstract=d.get("abstract") or "",
+    )
 
 
 def _parse_si(d: dict) -> Paper | None:
     if not d or not d.get("title"):
         return None
-    y = d.get("publication_date", d.get("year", ""))
-    if isinstance(y, str) and len(y) >= 4:
-        y = y[:4]
-    return Paper(title=d["title"], authors=d.get("authors", ""),
-                 year=str(y), venue=d.get("venue", ""),
-                 arxiv_id=d.get("arxiv_id", ""), abstract=d.get("abstract", ""))
+    year = d.get("publication_date", d.get("year", ""))
+    if isinstance(year, str) and len(year) >= 4:
+        year = year[:4]
+    return Paper(
+        title=d["title"], authors=d.get("authors", ""),
+        year=str(year), venue=d.get("venue", ""),
+        arxiv_id=d.get("arxiv_id", ""), abstract=d.get("abstract", ""),
+    )
 
 
-# ── Job definitions (each returns papers to add) ──────────────────────────
-
-# Semantic Scholar jobs
-
-SS = "https://api.semanticscholar.org/graph/v1"
-SS_F = "paperId,externalIds,title,year,venue,citationCount,abstract,authors"
-
-
-def _job_ss_keyword(query: str, idx: int) -> tuple[list[Paper], str]:
-    raw = _get(f"{SS}/paper/search?query={quote(query)}&limit=20&fields={SS_F}", limiter=_ss_limiter)
-    if not raw:
-        return [], f"ss_kw:{idx}"
-    data = json.loads(raw.decode())
-    papers = [p for d in data.get("data", []) if (p := _parse_ss(d))]
-    return papers, f"ss_kw:{idx}"
+def _parse_arxiv_entry(entry) -> Paper | None:
+    title = entry.findtext(f"{ARXIV_NS}title", "").replace("\n", " ").strip()
+    if not title:
+        return None
+    names = [a.findtext(f"{ARXIV_NS}name", "") for a in entry.findall(f"{ARXIV_NS}author")]
+    arxiv_id = _extract_arxiv_id(entry)
+    return Paper(
+        title=title, authors=_format_authors(names),
+        year=entry.findtext(f"{ARXIV_NS}published", "")[:4],
+        venue="arXiv", arxiv_id=arxiv_id,
+        abstract=entry.findtext(f"{ARXIV_NS}summary", "").replace("\n", " ").strip(),
+    )
 
 
-def _job_ss_citations(arxiv_id: str) -> tuple[list[Paper], str]:
-    all_papers = []
-    for direction in ["citations", "references"]:
-        raw = _get(f"{SS}/paper/ArXiv:{arxiv_id}/{direction}?limit=200&fields={SS_F}", limiter=_ss_limiter)
-        if raw:
-            data = json.loads(raw.decode())
-            fld = "citingPaper" if direction == "citations" else "citedPaper"
-            papers = [p for it in data.get("data", []) if (x := it.get(fld)) and (p := _parse_ss(x))]
-            all_papers.extend(papers)
-    return all_papers, f"ss_cite:{arxiv_id}"
-
-
-def _job_ss_author(name: str) -> tuple[list[Paper], str]:
-    raw = _get(f"{SS}/author/search?query={quote(name)}&limit=1", limiter=_ss_limiter)
-    if not raw:
-        return [], f"author:{name}"
-    data = json.loads(raw.decode())
-    if not data.get("data"):
-        return [], f"author:{name}"
-    aid = data["data"][0].get("authorId")
-    if not aid:
-        return [], f"author:{name}"
-    raw2 = _get(f"{SS}/author/{aid}/papers?limit=50&fields={SS_F}", limiter=_ss_limiter)
-    if not raw2:
-        return [], f"author:{name}"
-    data2 = json.loads(raw2.decode())
-    papers = [p for d in data2.get("data", []) if (p := _parse_ss(d))]
-    return papers, f"author:{name}"
-
-
-# Scholar Inbox jobs
-
-SI = "https://api.scholar-inbox.com/api"
-
-
-def _si_h(cookie: str) -> dict:
-    return {"Cookie": f"session={cookie}", "Origin": "https://www.scholar-inbox.com",
-            "Referer": "https://www.scholar-inbox.com/"}
-
-
-def _job_si_semantic(query: str, idx: int, cookie: str, pages: int = 3) -> tuple[list[Paper], str]:
-    h = _si_h(cookie)
-    all_papers = []
-    for page in range(pages):
-        r = _post(f"{SI}/semantic-search", {"text_input": query, "embedding": None, "p": page},
-                  h, limiter=_si_limiter)
-        if not r or not r.get("papers"):
-            break
-        all_papers.extend(p for d in r["papers"] if (p := _parse_si(d)))
-    return all_papers, f"si_sem:{idx}"
-
-
-def _job_si_similar(paper_id: int, cookie: str) -> tuple[list[Paper], str]:
-    raw = _get(f"{SI}/get_similar_papers?paper_id={paper_id}", _si_h(cookie), limiter=_si_limiter)
-    if not raw:
-        return [], f"si_sim:{paper_id}"
-    r = json.loads(raw.decode())
-    papers = [p for d in r.get("similar_papers", r.get("papers", [])) if (p := _parse_si(d))]
-    return papers, f"si_sim:{paper_id}"
-
-
-def _job_si_detail(paper_id: int, cookie: str) -> tuple[list[Paper], str]:
-    raw = _get(f"{SI}/paper/{paper_id}", _si_h(cookie), limiter=_si_limiter)
-    if not raw:
-        return [], f"si_det:{paper_id}"
-    r = json.loads(raw.decode())
-    all_papers = []
-    for key in ["references", "cited_by", "similar_papers"]:
-        all_papers.extend(p for d in r.get(key, []) if (p := _parse_si(d)))
-    return all_papers, f"si_det:{paper_id}"
-
-
-def si_collect_ids(query: str, cookie: str, limit: int = 30) -> list[int]:
-    r = _post(f"{SI}/semantic-search", {"text_input": query, "embedding": None, "p": 0},
-              _si_h(cookie), limiter=_si_limiter)
-    if not r or "papers" not in r:
-        return []
-    return [pid for d in r["papers"][:limit] if (pid := d.get("id", d.get("paper_id")))]
-
-
-# arXiv jobs
-
-def _job_arxiv(query: str, idx: int) -> tuple[list[Paper], str]:
-    ns = "{http://www.w3.org/2005/Atom}"
-    raw = _get(f"http://export.arxiv.org/api/query?search_query={quote(query)}&max_results=30&sortBy=relevance",
-               limiter=_arxiv_limiter)
-    if not raw:
-        return [], f"arxiv:{idx}"
-    papers = []
-    try:
-        root = ET.fromstring(raw.decode())
-        for e in root.findall(f"{ns}entry"):
-            title = e.findtext(f"{ns}title", "").replace("\n", " ").strip()
-            if not title:
-                continue
-            au = [a.findtext(f"{ns}name", "") for a in e.findall(f"{ns}author")]
-            arxid = ""
-            for lnk in e.findall(f"{ns}link"):
-                href = lnk.get("href", "")
-                if "arxiv.org/abs/" in href:
-                    arxid = href.split("/abs/")[-1].split("v")[0]
-            papers.append(Paper(
-                title=title,
-                authors=", ".join(au[:4]) + (" et al." if len(au) > 4 else ""),
-                year=e.findtext(f"{ns}published", "")[:4], venue="arXiv",
-                arxiv_id=arxid,
-                abstract=e.findtext(f"{ns}summary", "").replace("\n", " ").strip(),
-            ))
-    except Exception:
-        pass
-    return papers, f"arxiv:{idx}"
-
-
-# ── OpenAlex jobs ─────────────────────────────────────────────────────────
-
-OA = "https://api.openalex.org"
+def _extract_arxiv_id(entry) -> str:
+    for link in entry.findall(f"{ARXIV_NS}link"):
+        href = link.get("href", "")
+        if "arxiv.org/abs/" in href:
+            return href.split("/abs/")[-1].split("v")[0]
+    return ""
 
 
 def _parse_oalex(d: dict) -> Paper | None:
     if not d or not d.get("title"):
         return None
-    au_list = d.get("authorships") or []
-    names = ", ".join(
-        a.get("author", {}).get("display_name", "") for a in au_list[:4]
-    )
-    if len(au_list) > 4:
-        names += " et al."
-    year = str(d.get("publication_year") or "")
-    venue = ""
-    loc = d.get("primary_location") or {}
-    src = loc.get("source") or {}
-    if src.get("display_name"):
-        venue = src["display_name"]
-    arxiv_id = ""
-    ids = d.get("ids") or {}
-    if ids.get("openalex"):
-        pass  # we want arxiv
-    doi = d.get("doi") or ""
-    # Try to extract arxiv from locations
-    for location in d.get("locations") or []:
-        landing = location.get("landing_page_url") or ""
-        if "arxiv.org/abs/" in landing:
-            arxiv_id = landing.split("/abs/")[-1].split("v")[0]
-            break
-    abstract = ""
-    inv_index = d.get("abstract_inverted_index")
-    if inv_index:
-        words: dict[int, str] = {}
-        for word, positions in inv_index.items():
-            for pos in positions:
-                words[pos] = word
-        abstract = " ".join(words[i] for i in sorted(words))
+    names = [a.get("author", {}).get("display_name", "")
+             for a in (d.get("authorships") or [])]
     return Paper(
-        title=d["title"], authors=names, year=year, venue=venue,
-        arxiv_id=arxiv_id, citation_count=d.get("cited_by_count") or 0,
-        abstract=abstract,
+        title=d["title"], authors=_format_authors(names),
+        year=str(d.get("publication_year") or ""),
+        venue=_extract_oalex_venue(d),
+        arxiv_id=_extract_oalex_arxiv(d),
+        citation_count=d.get("cited_by_count") or 0,
+        abstract=_reconstruct_oalex_abstract(d),
     )
 
 
-def _job_oalex_search(query: str, idx: int) -> tuple[list[Paper], str]:
-    url = f"{OA}/works?search={quote(query)}&per_page=25&sort=relevance_score:desc"
-    raw = _get(url, limiter=_oalex_limiter)
-    if not raw:
-        return [], f"oalex:{idx}"
-    data = json.loads(raw.decode())
-    papers = [p for d in data.get("results", []) if (p := _parse_oalex(d))]
-    return papers, f"oalex:{idx}"
+def _extract_oalex_venue(d: dict) -> str:
+    src = (d.get("primary_location") or {}).get("source") or {}
+    return src.get("display_name", "")
 
 
-def _job_oalex_cited_by(arxiv_id: str) -> tuple[list[Paper], str]:
-    url = f"{OA}/works?filter=cites:https://arxiv.org/abs/{arxiv_id}&per_page=50&sort=cited_by_count:desc"
-    raw = _get(url, limiter=_oalex_limiter)
-    if not raw:
-        return [], f"oalex_cite:{arxiv_id}"
-    data = json.loads(raw.decode())
-    papers = [p for d in data.get("results", []) if (p := _parse_oalex(d))]
-    return papers, f"oalex_cite:{arxiv_id}"
+def _extract_oalex_arxiv(d: dict) -> str:
+    for loc in d.get("locations") or []:
+        url = loc.get("landing_page_url") or ""
+        if "arxiv.org/abs/" in url:
+            return url.split("/abs/")[-1].split("v")[0]
+    return ""
 
 
-# ── DBLP jobs ─────────────────────────────────────────────────────────────
-
-DBLP = "https://dblp.org/search/publ/api"
+def _reconstruct_oalex_abstract(d: dict) -> str:
+    inv_index = d.get("abstract_inverted_index")
+    if not inv_index:
+        return ""
+    words: dict[int, str] = {}
+    for word, positions in inv_index.items():
+        for pos in positions:
+            words[pos] = word
+    return " ".join(words[i] for i in sorted(words))
 
 
 def _parse_dblp(hit: dict) -> Paper | None:
@@ -449,223 +362,264 @@ def _parse_dblp(hit: dict) -> Paper | None:
     title = info.get("title", "")
     if not title:
         return None
-    authors_raw = info.get("authors", {}).get("author", [])
-    if isinstance(authors_raw, dict):
-        authors_raw = [authors_raw]
-    names = ", ".join(
-        (a.get("text", a) if isinstance(a, dict) else str(a)) for a in authors_raw[:4]
-    )
-    if len(authors_raw) > 4:
-        names += " et al."
+    raw_authors = info.get("authors", {}).get("author", [])
+    if isinstance(raw_authors, dict):
+        raw_authors = [raw_authors]
+    names = [(a.get("text", a) if isinstance(a, dict) else str(a))
+             for a in raw_authors]
     return Paper(
-        title=title.rstrip("."), authors=names,
-        year=str(info.get("year", "")),
-        venue=info.get("venue", ""),
-        abstract="",  # DBLP doesn't have abstracts
+        title=title.rstrip("."), authors=_format_authors(names),
+        year=str(info.get("year", "")), venue=info.get("venue", ""),
     )
 
 
-def _job_dblp_search(query: str, idx: int) -> tuple[list[Paper], str]:
-    url = f"{DBLP}?q={quote(query)}&format=json&h=30"
-    raw = _get(url, limiter=_dblp_limiter)
+# ── Search jobs ───────────────────────────────────────────────────────────
+# Each returns (list[Paper], source_tag).
+
+def _si_headers(cookie: str) -> dict:
+    return {"Cookie": f"session={cookie}",
+            "Origin": "https://www.scholar-inbox.com",
+            "Referer": "https://www.scholar-inbox.com/"}
+
+# Semantic Scholar
+
+def job_ss_keyword(query: str, idx: int) -> tuple[list[Paper], str]:
+    data = _get_json(f"{SS_BASE}/paper/search?query={quote(query)}&limit=20&fields={SS_FIELDS}", "ss")
+    papers = [p for d in (data or {}).get("data", []) if (p := _parse_ss(d))]
+    return papers, f"ss_kw:{idx}"
+
+
+def job_ss_citations(arxiv_id: str) -> tuple[list[Paper], str]:
+    papers = []
+    for direction in ["citations", "references"]:
+        data = _get_json(f"{SS_BASE}/paper/ArXiv:{arxiv_id}/{direction}?limit=200&fields={SS_FIELDS}", "ss")
+        field_name = "citingPaper" if direction == "citations" else "citedPaper"
+        for item in (data or {}).get("data", []):
+            if (d := item.get(field_name)) and (p := _parse_ss(d)):
+                papers.append(p)
+    return papers, f"ss_cite:{arxiv_id}"
+
+
+def job_ss_author(name: str) -> tuple[list[Paper], str]:
+    tag = f"author:{name}"
+    data = _get_json(f"{SS_BASE}/author/search?query={quote(name)}&limit=1", "ss")
+    author_id = _extract_ss_author_id(data)
+    if not author_id:
+        return [], tag
+    data = _get_json(f"{SS_BASE}/author/{author_id}/papers?limit=50&fields={SS_FIELDS}", "ss")
+    papers = [p for d in (data or {}).get("data", []) if (p := _parse_ss(d))]
+    return papers, tag
+
+
+def _extract_ss_author_id(data: dict | None) -> str | None:
+    if not data or not data.get("data"):
+        return None
+    return data["data"][0].get("authorId")
+
+# Scholar Inbox
+
+def job_si_semantic(query: str, idx: int, cookie: str, pages: int = 3) -> tuple[list[Paper], str]:
+    papers = []
+    for page in range(pages):
+        data = _post_json(f"{SI_BASE}/semantic-search",
+                          {"text_input": query, "embedding": None, "p": page},
+                          "si", _si_headers(cookie))
+        if not data or not data.get("papers"):
+            break
+        papers.extend(p for d in data["papers"] if (p := _parse_si(d)))
+    return papers, f"si_sem:{idx}"
+
+
+def job_si_similar(paper_id: int, cookie: str) -> tuple[list[Paper], str]:
+    data = _get_json(f"{SI_BASE}/get_similar_papers?paper_id={paper_id}",
+                     "si", _si_headers(cookie))
+    items = (data or {}).get("similar_papers", (data or {}).get("papers", []))
+    papers = [p for d in items if (p := _parse_si(d))]
+    return papers, f"si_sim:{paper_id}"
+
+
+def job_si_detail(paper_id: int, cookie: str) -> tuple[list[Paper], str]:
+    data = _get_json(f"{SI_BASE}/paper/{paper_id}", "si", _si_headers(cookie))
+    papers = []
+    for key in ["references", "cited_by", "similar_papers"]:
+        papers.extend(p for d in (data or {}).get(key, []) if (p := _parse_si(d)))
+    return papers, f"si_det:{paper_id}"
+
+
+def si_collect_ids(query: str, cookie: str, limit: int = 30) -> list[int]:
+    data = _post_json(f"{SI_BASE}/semantic-search",
+                      {"text_input": query, "embedding": None, "p": 0},
+                      "si", _si_headers(cookie))
+    if not data or "papers" not in data:
+        return []
+    return [pid for d in data["papers"][:limit]
+            if (pid := d.get("id", d.get("paper_id")))]
+
+# arXiv
+
+def job_arxiv(query: str, idx: int) -> tuple[list[Paper], str]:
+    url = f"{ARXIV_BASE}?search_query={quote(query)}&max_results=30&sortBy=relevance"
+    raw = _fetch(url, limiter="arxiv")
     if not raw:
-        return [], f"dblp:{idx}"
-    data = json.loads(raw.decode())
-    hits = data.get("result", {}).get("hits", {}).get("hit", [])
+        return [], f"arxiv:{idx}"
+    try:
+        root = ET.fromstring(raw.decode())
+        papers = [p for e in root.findall(f"{ARXIV_NS}entry")
+                  if (p := _parse_arxiv_entry(e))]
+        return papers, f"arxiv:{idx}"
+    except Exception:
+        return [], f"arxiv:{idx}"
+
+# OpenAlex
+
+def job_oalex_search(query: str, idx: int) -> tuple[list[Paper], str]:
+    url = f"{OA_BASE}/works?search={quote(query)}&per_page=25&sort=relevance_score:desc"
+    data = _get_json(url, "oalex")
+    papers = [p for d in (data or {}).get("results", []) if (p := _parse_oalex(d))]
+    return papers, f"oalex:{idx}"
+
+
+def job_oalex_cited_by(arxiv_id: str) -> tuple[list[Paper], str]:
+    url = (f"{OA_BASE}/works?filter=cites:https://arxiv.org/abs/{arxiv_id}"
+           f"&per_page=50&sort=cited_by_count:desc")
+    data = _get_json(url, "oalex")
+    papers = [p for d in (data or {}).get("results", []) if (p := _parse_oalex(d))]
+    return papers, f"oalex_cite:{arxiv_id}"
+
+# DBLP
+
+def job_dblp_search(query: str, idx: int) -> tuple[list[Paper], str]:
+    data = _get_json(f"{DBLP_BASE}?q={quote(query)}&format=json&h=30", "dblp")
+    hits = (data or {}).get("result", {}).get("hits", {}).get("hit", [])
     papers = [p for h in hits if (p := _parse_dblp(h))]
     return papers, f"dblp:{idx}"
 
 
-def _job_dblp_venue(venue: str, year: int) -> tuple[list[Paper], str]:
-    """Search for papers from a specific venue+year (e.g. NeurIPS 2024)."""
-    url = f"{DBLP}?q=venue:{quote(venue)}+year:{year}&format=json&h=100"
-    raw = _get(url, limiter=_dblp_limiter)
-    if not raw:
-        return [], f"dblp_venue:{venue}:{year}"
-    data = json.loads(raw.decode())
-    hits = data.get("result", {}).get("hits", {}).get("hit", [])
+def job_dblp_venue(venue: str, year: int) -> tuple[list[Paper], str]:
+    data = _get_json(f"{DBLP_BASE}?q=venue:{quote(venue)}+year:{year}&format=json&h=100", "dblp")
+    hits = (data or {}).get("result", {}).get("hits", {}).get("hit", [])
     papers = [p for h in hits if (p := _parse_dblp(h))]
     return papers, f"dblp_venue:{venue}:{year}"
 
 
-# ── Job scheduler ─────────────────────────────────────────────────────────
+# ── Scheduler ─────────────────────────────────────────────────────────────
 
-def run_jobs(pool: PaperPool, jobs: list, max_workers: int = 2) -> None:
-    """Run search jobs. Each job returns (list[Paper], source_tag).
-    Uses a small worker pool — rate limiters serialize per-API."""
-    total = len(jobs)
-    done = 0
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(job): job for job in jobs}
-        for future in as_completed(futures):
-            done += 1
-            try:
-                papers, source = future.result()
-                added = pool.add_many(papers, source)
-                if papers:
-                    print(f"  [{done}/{total}] {source}: {len(papers)} found, {added} new "
-                          f"(pool: {pool.size})", file=sys.stderr)
-            except Exception as e:
-                print(f"  [{done}/{total}] error: {e}", file=sys.stderr)
+def run_parallel(**api_jobs: list) -> None:
+    """Run job lists across APIs in parallel. Each kwarg is an API name
+    mapped to a list of callables returning (list[Paper], tag)."""
+    return _parallel_runner
 
+# Actually, let's keep it simple:
 
-def run_parallel_apis(pool: PaperPool,
-                      ss_jobs: list = None, si_jobs: list = None,
-                      arxiv_jobs: list = None, oalex_jobs: list = None,
-                      dblp_jobs: list = None) -> None:
-    """Run jobs across all APIs truly in parallel.
-    Each API gets its own thread so rate limiters serialize within
-    an API, but different APIs overlap."""
-    ss_jobs = ss_jobs or []
-    si_jobs = si_jobs or []
-    arxiv_jobs = arxiv_jobs or []
-    oalex_jobs = oalex_jobs or []
-    dblp_jobs = dblp_jobs or []
-    total = len(ss_jobs) + len(si_jobs) + len(arxiv_jobs) + len(oalex_jobs) + len(dblp_jobs)
-    apis = sum(1 for j in [ss_jobs, si_jobs, arxiv_jobs, oalex_jobs, dblp_jobs] if j)
-    print(f"  Running {total} jobs across {apis} APIs in parallel", file=sys.stderr)
-    done = [0]
-    lock = threading.Lock()
+def run_api_threads(pool: PaperPool, api_jobs: dict[str, list]) -> None:
+    """Run one thread per API. Jobs within an API run sequentially
+    (respecting rate limits), but different APIs overlap."""
+    all_jobs = [(label, jobs) for label, jobs in api_jobs.items() if jobs]
+    total = sum(len(jobs) for _, jobs in all_jobs)
+    print(f"  {total} jobs across {len(all_jobs)} APIs", file=sys.stderr)
 
-    def _run_batch(jobs: list, label: str) -> None:
-        for job in jobs:
-            try:
-                papers, source = job()
-                added = pool.add_many(papers, source)
-                with lock:
-                    done[0] += 1
-                    if papers:
-                        print(f"  [{done[0]}/{total}] {source}: {len(papers)} found, "
-                              f"{added} new (pool: {pool.size})", file=sys.stderr)
-            except Exception as e:
-                with lock:
-                    done[0] += 1
-                    print(f"  [{done[0]}/{total}] {label} error: {e}", file=sys.stderr)
+    counter = _Counter()
 
-    threads = []
-    for jobs, label in [(ss_jobs, "SS"), (si_jobs, "SI"), (arxiv_jobs, "arXiv"),
-                        (oalex_jobs, "OpenAlex"), (dblp_jobs, "DBLP")]:
-        if jobs:
-            threads.append(threading.Thread(target=_run_batch, args=(jobs, label), daemon=True))
-
+    threads = [
+        threading.Thread(
+            target=_run_job_list,
+            args=(pool, jobs, label, counter, total),
+            daemon=True,
+        )
+        for label, jobs in all_jobs
+    ]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
 
 
-# ── High-level API (used by auto_citetion.py) ────────────────────────────
+class _Counter:
+    def __init__(self):
+        self.value = 0
+        self.lock = threading.Lock()
 
-def ss_keyword(pool: PaperPool, queries: list[str]) -> None:
-    print("\n[Semantic Scholar] keyword search", file=sys.stderr)
-    jobs = [lambda q=q, i=i: _job_ss_keyword(q, i) for i, q in enumerate(queries)]
-    run_jobs(pool, jobs)
-
-
-def ss_citations(pool: PaperPool, arxiv_ids: list[str]) -> None:
-    print("\n[Semantic Scholar] citation chains", file=sys.stderr)
-    jobs = [lambda a=a: _job_ss_citations(a) for a in arxiv_ids]
-    run_jobs(pool, jobs)
+    def increment(self) -> int:
+        with self.lock:
+            self.value += 1
+            return self.value
 
 
-def ss_authors(pool: PaperPool, authors: list[str]) -> None:
-    print("\n[Semantic Scholar] author tracking", file=sys.stderr)
-    jobs = [lambda n=n: _job_ss_author(n) for n in authors]
-    run_jobs(pool, jobs)
-
-
-def si_semantic(pool: PaperPool, queries: list[str], cookie: str) -> None:
-    print("\n[Scholar Inbox] semantic search", file=sys.stderr)
-    jobs = [lambda q=q, i=i: _job_si_semantic(q, i, cookie) for i, q in enumerate(queries)]
-    run_jobs(pool, jobs)
-
-
-def si_similar(pool: PaperPool, paper_ids: list[int], cookie: str) -> None:
-    print("\n[Scholar Inbox] similar papers", file=sys.stderr)
-    jobs = [lambda pid=pid: _job_si_similar(pid, cookie) for pid in paper_ids]
-    run_jobs(pool, jobs)
-
-
-def si_detail(pool: PaperPool, paper_ids: list[int], cookie: str) -> None:
-    print("\n[Scholar Inbox] paper refs+cited_by", file=sys.stderr)
-    jobs = [lambda pid=pid: _job_si_detail(pid, cookie) for pid in paper_ids]
-    run_jobs(pool, jobs)
-
-
-def arxiv_search(pool: PaperPool, queries: list[str]) -> None:
-    print("\n[arXiv] search", file=sys.stderr)
-    jobs = [lambda q=q, i=i: _job_arxiv(q, i) for i, q in enumerate(queries)]
-    run_jobs(pool, jobs)
-
-
-def oalex_search(pool: PaperPool, queries: list[str]) -> None:
-    print("\n[OpenAlex] search", file=sys.stderr)
-    jobs = [lambda q=q, i=i: _job_oalex_search(q, i) for i, q in enumerate(queries)]
-    run_jobs(pool, jobs)
-
-
-def oalex_cited_by(pool: PaperPool, arxiv_ids: list[str]) -> None:
-    print("\n[OpenAlex] cited-by chains", file=sys.stderr)
-    jobs = [lambda a=a: _job_oalex_cited_by(a) for a in arxiv_ids]
-    run_jobs(pool, jobs)
-
-
-def dblp_search(pool: PaperPool, queries: list[str]) -> None:
-    print("\n[DBLP] search", file=sys.stderr)
-    jobs = [lambda q=q, i=i: _job_dblp_search(q, i) for i, q in enumerate(queries)]
-    run_jobs(pool, jobs)
-
-
-def dblp_venues(pool: PaperPool, venues: list[tuple[str, int]]) -> None:
-    """Search specific venue+year combos, e.g. [("NeurIPS", 2024), ("CVPR", 2025)]."""
-    print("\n[DBLP] venue scan", file=sys.stderr)
-    jobs = [lambda v=v, y=y: _job_dblp_venue(v, y) for v, y in venues]
-    run_jobs(pool, jobs)
+def _run_job_list(pool: PaperPool, jobs: list, label: str,
+                  counter: _Counter, total: int) -> None:
+    for job in jobs:
+        try:
+            papers, source = job()
+            added = pool.add_many(papers, source)
+            n = counter.increment()
+            if papers:
+                print(f"  [{n}/{total}] {source}: {len(papers)} found, "
+                      f"{added} new (pool: {pool.size})", file=sys.stderr)
+        except Exception as e:
+            n = counter.increment()
+            print(f"  [{n}/{total}] {label} error: {e}", file=sys.stderr)
 
 
 # ── Scoring ───────────────────────────────────────────────────────────────
 
-HIGH = ["spurious correlation", "shortcut learning", "counterfactual explanation",
-        "counterfactual image", "bias discovery", "feature discovery", "model diagnosis",
-        "vision-language model", "attention map", "grad-cam", "score-cam",
-        "counterfactual generation", "semantic feature", "concept discovery"]
-MED = ["explainability", "interpretability", "debiasing", "group robustness",
-       "diffusion", "image editing", "saliency", "concept-based", "attribution",
-       "vlm", "multimodal"]
-LOW = ["robustness", "distribution shift", "imagenet", "augmentation", "causal", "classifier"]
+def score_paper(paper: Paper) -> float:
+    text = f"{paper.title} {paper.abstract}".lower()
+    s = _keyword_score(text)
+    s += _citation_bonus(paper.citation_count)
+    s += _recency_bonus(paper.year)
+    s += _venue_bonus(paper.venue)
+    s += _cross_reference_bonus(paper)
+    return round(max(s, 0), 1)
 
-CATEGORIES = {
-    "similar_method": ["counterfactual", "feature discovery", "bias discovery", "model diagnosis", "attention map"],
-    "counterfactual_xai": ["counterfactual explanation", "counterfactual image", "counterfactual generation"],
-    "shortcut_spurious": ["spurious correlation", "shortcut learning", "group robustness", "debiasing"],
-    "vlm_multimodal": ["vision-language", "vlm", "multimodal", "clip", "large language model"],
-    "diffusion_editing": ["diffusion", "image editing", "text-guided", "generative model"],
-    "explainability": ["explainability", "interpretability", "attribution", "grad-cam", "score-cam", "saliency"],
-    "augmentation": ["augmentation", "data augmentation", "synthetic data"],
-}
+
+def _keyword_score(text: str) -> float:
+    s = sum(3.0 for kw in HIGH_KEYWORDS if kw in text)
+    s += sum(2.0 for kw in MED_KEYWORDS if kw in text)
+    s += sum(1.0 for kw in LOW_KEYWORDS if kw in text)
+    return s
+
+
+def _citation_bonus(count: int) -> float:
+    return min(count / 40, 8.0)
+
+
+def _recency_bonus(year: str) -> float:
+    if not year.isdigit():
+        return 0
+    y = int(year)
+    bonus = 0
+    if y >= 2023:
+        bonus += 3
+    if y >= 2024:
+        bonus += 2
+    if y >= 2025:
+        bonus += 2
+    return bonus
+
+
+def _venue_bonus(venue: str) -> float:
+    if venue and any(v in venue.lower() for v in TOP_VENUES):
+        return 4.0
+    return 0.0
+
+
+def _cross_reference_bonus(paper: Paper) -> float:
+    source_hits = paper.source_count * 2
+    strategy_types = len(set(src.split(":")[0] for src in paper.sources))
+    return source_hits + strategy_types * 3
+
+
+def categorize_paper(paper: Paper) -> str:
+    text = f"{paper.title} {paper.abstract}".lower()
+    best, best_n = "other", 0
+    for cat, keywords in CATEGORIES.items():
+        hits = sum(1 for kw in keywords if kw in text)
+        if hits > best_n:
+            best, best_n = cat, hits
+    return best
 
 
 def score_and_categorize(papers: list[Paper]) -> None:
     for p in papers:
-        text = f"{p.title} {p.abstract}".lower()
-        s = sum(3.0 for kw in HIGH if kw in text)
-        s += sum(2.0 for kw in MED if kw in text)
-        s += sum(1.0 for kw in LOW if kw in text)
-        s += min(p.citation_count / 40, 8.0)
-        if p.year.isdigit():
-            y = int(p.year)
-            if y >= 2023: s += 3
-            if y >= 2024: s += 2
-            if y >= 2025: s += 2
-        if p.venue and any(v in p.venue.lower() for v in ["neurips", "icml", "iclr", "cvpr", "eccv", "iccv"]):
-            s += 4
-        s += p.source_count * 2
-        s += len(set(src.split(":")[0] for src in p.sources)) * 3
-        p.score = round(max(s, 0), 1)
-
-        best, best_n = "other", 0
-        for cat, kws in CATEGORIES.items():
-            n = sum(1 for kw in kws if kw in text)
-            if n > best_n:
-                best, best_n = cat, n
-        p.category = best
+        p.score = score_paper(p)
+        p.category = categorize_paper(p)
