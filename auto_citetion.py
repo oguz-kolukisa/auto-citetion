@@ -67,49 +67,49 @@ def run_recursive_expansion(pool: PaperPool, known: set[str],
                             min_score: float, out: Path,
                             max_depth: int = 3, expand_top: int = 15) -> None:
     """Recursively expand: score papers, take top hits, crawl their
-    citations/similar, score again, repeat until no new finds."""
+    citations/similar in parallel, score again, repeat until no new finds."""
+    from search import (run_jobs, _job_ss_citations, _job_si_similar,
+                        si_collect_ids)
+
     cookie_path = out / ".scholar_inbox_cookie"
     cookie = cookie_path.read_text().strip() if cookie_path.exists() else ""
 
     for depth in range(1, max_depth + 1):
-        # Score everything in pool
         all_papers = pool.all()
         score_and_categorize(all_papers)
         novel = [p for p in all_papers if not is_known(p.title, known) and p.score >= min_score]
         novel.sort(key=lambda p: p.score, reverse=True)
 
-        # Pick top papers that have arxiv_ids for expansion
         seeds = [p for p in novel if p.arxiv_id][:expand_top]
         if not seeds:
-            print(f"\n[Recursive depth {depth}] No new seeds, stopping.", file=sys.stderr)
+            print(f"\n[Depth {depth}] No seeds, stopping.", file=sys.stderr)
             break
 
         before = pool.size
-        print(f"\n{'='*50}\n[Recursive depth {depth}] Expanding top {len(seeds)} papers\n{'='*50}", file=sys.stderr)
+        print(f"\n{'='*50}\n[Depth {depth}] Expanding {len(seeds)} papers in parallel\n{'='*50}", file=sys.stderr)
 
-        # Expand via Semantic Scholar citations + references
-        seed_ids = [p.arxiv_id for p in seeds]
-        ss_citations(pool, seed_ids)
+        # Build all jobs for this round — SS and SI run concurrently
+        jobs = []
+        for p in seeds:
+            jobs.append(lambda a=p.arxiv_id: _job_ss_citations(a))
 
-        # Expand via Scholar Inbox similar papers
         if cookie:
             si_ids = []
             for p in seeds:
-                found = si_collect_ids(p.title, cookie, limit=3)
+                found = si_collect_ids(p.title, cookie, limit=5)
                 si_ids.extend(found)
-                if len(si_ids) >= 20:
+                if len(si_ids) >= 40:
                     break
-                import time
-                time.sleep(1)
-            if si_ids:
-                si_similar(pool, si_ids[:20], cookie)
+            for pid in si_ids[:40]:
+                jobs.append(lambda pid=pid: _job_si_similar(pid, cookie))
 
-        after = pool.size
-        new_found = after - before
-        print(f"[Recursive depth {depth}] +{new_found} new papers (total: {after})", file=sys.stderr)
+        run_jobs(pool, jobs, max_workers=8)
+
+        new_found = pool.size - before
+        print(f"[Depth {depth}] +{new_found} new (total: {pool.size})", file=sys.stderr)
 
         if new_found < 5:
-            print(f"[Recursive depth {depth}] Few new finds, stopping.", file=sys.stderr)
+            print(f"[Depth {depth}] Few new finds, stopping.", file=sys.stderr)
             break
 
 
@@ -224,11 +224,11 @@ def main():
     ap.add_argument("--skip-si", action="store_true")
     ap.add_argument("--skip-llm", action="store_true")
     ap.add_argument("--model", default="google/gemma-4-E4B-it")
-    ap.add_argument("--top", type=int, default=80, help="Papers to evaluate with LLM")
-    ap.add_argument("--min-score", type=float, default=4.0)
+    ap.add_argument("--top", type=int, default=100, help="Papers to evaluate with LLM")
+    ap.add_argument("--min-score", type=float, default=3.0)
     ap.add_argument("--fast", action="store_true")
     ap.add_argument("--depth", type=int, default=3, help="Recursive expansion depth (0=off)")
-    ap.add_argument("--expand-top", type=int, default=15, help="Papers to expand per round")
+    ap.add_argument("--expand-top", type=int, default=25, help="Papers to expand per round")
     args = ap.parse_args()
 
     out = Path(args.output)
