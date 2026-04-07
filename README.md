@@ -21,8 +21,8 @@ config.json → Search (7 strategies) → Score & Filter → LLM Evaluate → fi
 ## Setup
 
 ```bash
-git clone https://github.com/oguz-kolukisa/auto-citetion.git
-cd auto-citetion
+git clone https://github.com/oguz-kolukisa/abusive-citation-search.git
+cd abusive-citation-search
 uv sync
 ```
 
