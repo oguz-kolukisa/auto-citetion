@@ -1,15 +1,38 @@
+# Python
 __pycache__/
 *.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
 .venv/
+
+# Lock file (regenerated via uv sync)
 uv.lock
+
+# Secrets
 .scholar_inbox_cookie
 .token
+.env
+
+# Results & outputs (user-specific)
+*_results/
+*_config.json
 papers/
+pdfs/
 all_candidates.json
 llm_results.json
 final_reading_list.md
-*.log
+
+# Cache
+.cache/
+
+# Editors & OS
 .vscode/
 .idea/
 .DS_Store
+*.log
+
+# Claude Code
 .claude/
