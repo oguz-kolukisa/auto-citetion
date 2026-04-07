@@ -220,6 +220,10 @@ def _build_request(url: str, headers: dict | None, body: bytes | None) -> urllib
     return req
 
 
+MAX_RETRIES = 3
+BACKOFF_SECONDS = [15, 30, 60]
+
+
 def _fetch(url: str, headers: dict | None = None, body: bytes | None = None,
            limiter: str | None = None) -> bytes | None:
     body_str = body.decode() if body else ""
@@ -228,20 +232,29 @@ def _fetch(url: str, headers: dict | None = None, body: bytes | None = None,
         return cached
     if limiter:
         _limiters[limiter].wait()
-    try:
-        req = _build_request(url, headers, body)
-        with urllib.request.urlopen(req, timeout=20) as r:
-            data = r.read()
-        _write_cache(url, data, body_str)
-        return data
-    except urllib.error.HTTPError as e:
-        if e.code == 429:
-            print(f"    429 backoff 15s…", file=sys.stderr)
-            time.sleep(15)
-            return _fetch(url, headers, body, limiter)
-        return None
-    except Exception:
-        return None
+    return _fetch_with_retry(url, headers, body, body_str)
+
+
+def _fetch_with_retry(url: str, headers: dict | None, body: bytes | None,
+                      body_str: str) -> bytes | None:
+    for attempt in range(MAX_RETRIES):
+        try:
+            req = _build_request(url, headers, body)
+            with urllib.request.urlopen(req, timeout=20) as r:
+                data = r.read()
+            _write_cache(url, data, body_str)
+            return data
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                wait = BACKOFF_SECONDS[min(attempt, len(BACKOFF_SECONDS) - 1)]
+                print(f"    429 retry {attempt+1}/{MAX_RETRIES}, backoff {wait}s…", file=sys.stderr)
+                time.sleep(wait)
+                continue
+            return None
+        except Exception:
+            return None
+    print(f"    skipping after {MAX_RETRIES} retries: {url[:60]}", file=sys.stderr)
+    return None
 
 
 def _get_json(url: str, limiter: str, headers: dict | None = None) -> dict | None:

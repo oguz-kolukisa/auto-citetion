@@ -350,7 +350,17 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--fast", action="store_true")
     ap.add_argument("--depth", type=int, default=3)
     ap.add_argument("--expand-top", type=int, default=25)
+    ap.add_argument("--max-retries", type=int, default=3,
+                    help="Max 429 retries per request before skipping (default: 3)")
+    ap.add_argument("--backoff", type=int, nargs="+", default=[15, 30, 60],
+                    help="Backoff seconds per retry (default: 15 30 60)")
     return ap.parse_args()
+
+
+def _apply_retry_settings(args) -> None:
+    import search
+    search.MAX_RETRIES = args.max_retries
+    search.BACKOFF_SECONDS = args.backoff
 
 
 def main():
@@ -361,6 +371,7 @@ def main():
     known = load_known_titles(Path(args.refs) if args.refs else out / "references.md")
     raw_path = out / "all_candidates.json"
 
+    _apply_retry_settings(args)
     papers = run_search_stage(args, cfg, known, out, raw_path)
     papers = run_llm_stage(args, papers, cfg, out)
     run_report_stage(papers, out)
