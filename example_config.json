@@ -29,5 +29,9 @@
   "dblp_venues": [
     ["NeurIPS", 2024],
     ["CVPR", 2025]
+  ],
+
+  "google_scholar_cite_titles": [
+    "Exact Title of a Key Paper to Crawl Citations For"
   ]
 }

@@ -1,4 +1,4 @@
-"""Paper search across Semantic Scholar, Scholar Inbox, arXiv, OpenAlex, and DBLP.
+"""Paper search across Semantic Scholar, Scholar Inbox, arXiv, OpenAlex, DBLP, and Google Scholar.
 
 Each API runs in its own thread with its own rate limiter.
 Disk cache avoids re-fetching on reruns.
@@ -186,6 +186,7 @@ _limiters = {
     "arxiv": RateLimiter(3.0),
     "oalex": RateLimiter(0.2),
     "dblp": RateLimiter(1.0),
+    "gs": RateLimiter(5.0),
 }
 
 
@@ -513,6 +514,136 @@ def job_dblp_venue(venue: str, year: int) -> tuple[list[Paper], str]:
     hits = (data or {}).get("result", {}).get("hits", {}).get("hit", [])
     papers = [p for h in hits if (p := _parse_dblp(h))]
     return papers, f"dblp_venue:{venue}:{year}"
+
+# Google Scholar
+
+def _parse_gs(result) -> Paper | None:
+    title = result.get("bib", {}).get("title", "")
+    if not title:
+        return None
+    bib = result.get("bib", {})
+    authors = _format_authors(bib.get("author", []))
+    year = str(bib.get("pub_year", ""))
+    venue = bib.get("venue", "")
+    abstract = bib.get("abstract", "")
+    arxiv_id = _extract_gs_arxiv(result)
+    return Paper(
+        title=title, authors=authors, year=year, venue=venue,
+        arxiv_id=arxiv_id, citation_count=result.get("num_citations", 0),
+        abstract=abstract,
+    )
+
+
+def _extract_gs_arxiv(result) -> str:
+    for url in [result.get("eprint_url", ""), result.get("pub_url", "")]:
+        if "arxiv.org" in url:
+            parts = url.rstrip("/").split("/")
+            return parts[-1].split("v")[0]
+    return ""
+
+
+def _gs_search_cached(query: str, limit: int = 20) -> list:
+    cache_key = f"gs_search:{query}:{limit}"
+    cached = _read_cache(cache_key)
+    if cached:
+        return json.loads(cached.decode())
+    results = _gs_search_live(query, limit)
+    serialized = json.dumps(results)
+    _write_cache(cache_key, serialized.encode())
+    return results
+
+
+def _gs_search_live(query: str, limit: int) -> list:
+    try:
+        from scholarly import scholarly
+        results = []
+        for result in scholarly.search_pubs(query):
+            results.append(dict(result))
+            if len(results) >= limit:
+                break
+        return results
+    except Exception as e:
+        print(f"    Google Scholar error: {e}", file=sys.stderr)
+        return []
+
+
+def _gs_cite_cached(title: str) -> list:
+    cache_key = f"gs_cite:{title}"
+    cached = _read_cache(cache_key)
+    if cached:
+        return json.loads(cached.decode())
+    results = _gs_cite_live(title)
+    serialized = json.dumps(results)
+    _write_cache(cache_key, serialized.encode())
+    return results
+
+
+def _gs_cite_live(title: str) -> list:
+    try:
+        from scholarly import scholarly
+        search = scholarly.search_pubs(title)
+        pub = next(search, None)
+        if not pub:
+            return []
+        results = []
+        for cite in scholarly.citedby(pub):
+            results.append(dict(cite))
+            if len(results) >= 30:
+                break
+        return results
+    except Exception as e:
+        print(f"    Google Scholar citedby error: {e}", file=sys.stderr)
+        return []
+
+
+def job_gs_search(query: str, idx: int) -> tuple[list[Paper], str]:
+    _limiters["gs"].wait()
+    results = _gs_search_cached(query, limit=20)
+    papers = [p for r in results if (p := _parse_gs(r))]
+    return papers, f"gs_kw:{idx}"
+
+
+def job_gs_cited_by(title: str) -> tuple[list[Paper], str]:
+    _limiters["gs"].wait()
+    results = _gs_cite_cached(title)
+    papers = [p for r in results if (p := _parse_gs(r))]
+    return papers, f"gs_cite:{title[:30]}"
+
+
+def _gs_author_cached(name: str, limit: int = 20) -> list:
+    cache_key = f"gs_author:{name}:{limit}"
+    cached = _read_cache(cache_key)
+    if cached:
+        return json.loads(cached.decode())
+    results = _gs_author_live(name, limit)
+    serialized = json.dumps(results)
+    _write_cache(cache_key, serialized.encode())
+    return results
+
+
+def _gs_author_live(name: str, limit: int) -> list:
+    try:
+        from scholarly import scholarly
+        search = scholarly.search_author(name)
+        author = next(search, None)
+        if not author:
+            return []
+        author = scholarly.fill(author, sections=["publications"])
+        results = []
+        for pub in author.get("publications", [])[:limit]:
+            filled = scholarly.fill(pub)
+            results.append(dict(filled))
+        return results
+    except Exception as e:
+        print(f"    Google Scholar author error: {e}", file=sys.stderr)
+        return []
+
+
+def job_gs_author(name: str) -> tuple[list[Paper], str]:
+    _limiters["gs"].wait()
+    results = _gs_author_cached(name, limit=20)
+    papers = [p for r in results if (p := _parse_gs(r))]
+    return papers, f"gs_author:{name[:20]}"
 
 
 # ── Scheduler ─────────────────────────────────────────────────────────────

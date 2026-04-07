@@ -1,14 +1,15 @@
 # Auto-Citetion
 
-Automated paper discovery and LLM-powered citation evaluation. Searches 5 academic APIs in parallel, recursively expands through citation networks, and uses a local LLM to score each paper's relevance to your research.
+Automated paper discovery and LLM-powered citation evaluation. Searches 6 academic APIs in parallel, recursively expands through citation networks, and uses a local LLM to score each paper's relevance to your research.
 
 ## How It Works
 
 ```
-config.json --> Search (5 APIs x 7 strategies) --> Recursive Expansion --> Score & Filter --> LLM Evaluate --> final_reading_list.md
+config.json --> Search (6 APIs x 8 strategies) --> Recursive Expansion --> Score & Filter --> LLM Evaluate --> final_reading_list.md
 ```
 
-**Search strategies (5 APIs in parallel):**
+**Search strategies (6 APIs in parallel):**
+- **Google Scholar** - keyword search + cited-by traversal (via `scholarly`)
 - **Scholar Inbox** - semantic search + similar papers + refs/cited-by
 - **Semantic Scholar** - keyword search + citation chains + author tracking
 - **arXiv** - API search with category filters
@@ -86,6 +87,7 @@ config                Config JSON file (required)
 --refs PATH           references.md for dedup
 --skip-search         Skip search, use existing results
 --skip-si             Skip Scholar Inbox
+--skip-gs             Skip Google Scholar
 --skip-llm            Skip LLM evaluation
 --model ID            HuggingFace model (default: google/gemma-4-E4B-it)
 --top N               Papers to evaluate with LLM (default: 100)
@@ -125,7 +127,8 @@ results/
   "seed_arxiv_ids": ["2004.07780"],
   "key_authors": ["Author Name"],
   "arxiv_queries": ["all:\"keyword\" AND cat:cs.CV"],
-  "dblp_venues": [["NeurIPS", 2024], ["CVPR", 2025]]
+  "dblp_venues": [["NeurIPS", 2024], ["CVPR", 2025]],
+  "google_scholar_cite_titles": ["Exact Title of a Key Paper"]
 }
 ```
 

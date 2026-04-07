@@ -14,6 +14,7 @@ from auto_citetion.search import (
     job_si_semantic, job_si_similar, job_si_detail,
     job_arxiv, job_oalex_search, job_oalex_cited_by,
     job_dblp_search, job_dblp_venue,
+    job_gs_search, job_gs_cited_by, job_gs_author,
 )
 from auto_citetion.evaluate import LLMEvaluator
 
@@ -110,15 +111,27 @@ def build_arxiv_jobs(cfg: dict) -> list:
             for i, q in enumerate(cfg.get("arxiv_queries", []))]
 
 
+def build_gs_jobs(cfg: dict) -> list:
+    jobs = []
+    for i, q in enumerate(cfg.get("semantic_scholar_queries", [])):
+        jobs.append(lambda q=q, i=i: job_gs_search(q, i))
+    for title in cfg.get("google_scholar_cite_titles", []):
+        jobs.append(lambda t=title: job_gs_cited_by(t))
+    return jobs
+
+
 # ── Search stage ──────────────────────────────────────────────────────────
 
-def run_initial_search(pool: PaperPool, cfg: dict, cookie: str, skip_si: bool) -> None:
+def run_initial_search(pool: PaperPool, cfg: dict, cookie: str,
+                       skip_si: bool, skip_gs: bool) -> None:
     api_jobs = {"SS": build_ss_jobs(cfg), "arXiv": build_arxiv_jobs(cfg),
                 "OpenAlex": build_oalex_jobs(cfg), "DBLP": build_dblp_jobs(cfg)}
     if cookie and not skip_si:
         api_jobs["SI"] = build_si_jobs(cfg, cookie)
     elif not skip_si:
         print("No .scholar_inbox_cookie found, skipping Scholar Inbox.", file=sys.stderr)
+    if not skip_gs:
+        api_jobs["GS"] = build_gs_jobs(cfg)
 
     total = sum(len(j) for j in api_jobs.values())
     print(f"\nJobs: {' '.join(f'{k}={len(v)}' for k, v in api_jobs.items())} (total={total})",
@@ -129,7 +142,8 @@ def run_initial_search(pool: PaperPool, cfg: dict, cookie: str, skip_si: bool) -
 # ── Recursive expansion ──────────────────────────────────────────────────
 
 def run_recursive_expansion(pool: PaperPool, known: set[str], min_score: float,
-                            cookie: str, max_depth: int, expand_top: int) -> None:
+                            cookie: str, skip_gs: bool,
+                            max_depth: int, expand_top: int) -> None:
     for depth in range(1, max_depth + 1):
         seeds = _select_expansion_seeds(pool, known, min_score, expand_top)
         if not seeds:
@@ -139,7 +153,7 @@ def run_recursive_expansion(pool: PaperPool, known: set[str], min_score: float,
         before = pool.size
         print(f"\n{'='*50}\n[Depth {depth}] Expanding {len(seeds)} papers\n{'='*50}", file=sys.stderr)
 
-        api_jobs = _build_expansion_jobs(seeds, cookie)
+        api_jobs = _build_expansion_jobs(seeds, cookie, skip_gs)
         run_api_threads(pool, api_jobs)
 
         new_found = pool.size - before
@@ -152,18 +166,50 @@ def _select_expansion_seeds(pool: PaperPool, known: set[str],
                             min_score: float, limit: int) -> list[Paper]:
     papers = pool.all()
     score_and_categorize(papers)
-    novel = [p for p in papers if not is_known(p.title, known) and p.score >= min_score and p.arxiv_id]
+    novel = [p for p in papers if not is_known(p.title, known) and p.score >= min_score]
     novel.sort(key=lambda p: p.score, reverse=True)
     return novel[:limit]
 
 
-def _build_expansion_jobs(seeds: list[Paper], cookie: str) -> dict[str, list]:
-    ss_jobs = [lambda a=p.arxiv_id: job_ss_citations(a) for p in seeds]
-    si_jobs = []
-    if cookie:
-        si_ids = _collect_si_ids_for_seeds(seeds, cookie)
-        si_jobs = [lambda pid=pid: job_si_similar(pid, cookie) for pid in si_ids[:40]]
-    return {"SS": ss_jobs, "SI": si_jobs}
+def _build_expansion_jobs(seeds: list[Paper], cookie: str,
+                          skip_gs: bool) -> dict[str, list]:
+    ss_seeds = [p for p in seeds if p.arxiv_id]
+    ss_jobs = [lambda a=p.arxiv_id: job_ss_citations(a) for p in ss_seeds]
+    si_jobs = _build_si_expansion_jobs(seeds, cookie)
+    gs_jobs = _build_gs_expansion_jobs(seeds) if not skip_gs else []
+    return {"SS": ss_jobs, "SI": si_jobs, "GS": gs_jobs}
+
+
+def _build_si_expansion_jobs(seeds: list[Paper], cookie: str) -> list:
+    if not cookie:
+        return []
+    si_ids = _collect_si_ids_for_seeds(seeds, cookie)
+    return [lambda pid=pid: job_si_similar(pid, cookie) for pid in si_ids[:40]]
+
+
+def _build_gs_expansion_jobs(seeds: list[Paper]) -> list:
+    jobs = []
+    top_seeds = seeds[:10]
+    for p in top_seeds:
+        jobs.append(lambda t=p.title: job_gs_cited_by(t))
+    author_names = _extract_top_authors(seeds)
+    for name in author_names:
+        jobs.append(lambda n=name: job_gs_author(n))
+    return jobs
+
+
+def _extract_top_authors(seeds: list[Paper]) -> list[str]:
+    author_counts: dict[str, int] = {}
+    for p in seeds:
+        for name in _split_author_string(p.authors):
+            author_counts[name] = author_counts.get(name, 0) + 1
+    ranked = sorted(author_counts, key=lambda n: author_counts[n], reverse=True)
+    return ranked[:5]
+
+
+def _split_author_string(authors: str) -> list[str]:
+    cleaned = authors.replace(" et al.", "")
+    return [n.strip() for n in cleaned.split(",") if n.strip()]
 
 
 def _collect_si_ids_for_seeds(seeds: list[Paper], cookie: str) -> list[int]:
@@ -332,6 +378,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--refs", help="references.md for dedup")
     ap.add_argument("--skip-search", action="store_true")
     ap.add_argument("--skip-si", action="store_true")
+    ap.add_argument("--skip-gs", action="store_true", help="Skip Google Scholar")
     ap.add_argument("--skip-llm", action="store_true")
     ap.add_argument("--model", default="google/gemma-4-E4B-it")
     ap.add_argument("--top", type=int, default=100)
@@ -396,12 +443,13 @@ def run_search_stage(args, cfg, known, out, raw_path) -> list[Paper]:
     print("=" * 50, "\nSTAGE 1: Search\n" + "=" * 50, file=sys.stderr)
     pool = PaperPool()
     cookie = load_cookie(out)
-    run_initial_search(pool, cfg, cookie, args.skip_si)
+    run_initial_search(pool, cfg, cookie, args.skip_si, args.skip_gs)
     print(f"\nInitial pool: {pool.size}", file=sys.stderr)
 
     depth = 1 if args.fast else args.depth
     if depth > 0:
-        run_recursive_expansion(pool, known, args.min_score, cookie, depth, args.expand_top)
+        run_recursive_expansion(pool, known, args.min_score, cookie, args.skip_gs,
+                                depth, args.expand_top)
 
     papers = pool.all()
     score_and_categorize(papers)
